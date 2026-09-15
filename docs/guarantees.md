@@ -80,17 +80,19 @@ three attempts when an operation fails without a clear cause. The node
 starts with a warning after all three attempts fail because a temporary
 outage can end after startup. The node stops immediately when a required
 conditional write or ranged read is unsupported. It also stops when the
-store ignores a condition or returns a wrong range or wrong bytes. Set
-`CELLD_STORAGE_PROBE=0` to disable the startup test, or run
-`celld diagnose --read-only` with a credential that cannot write.
+store ignores a condition or returns a wrong range or wrong bytes. A node
+cannot disable this startup test. Use `celld diagnose --read-only` with a
+credential that cannot write.
 
 The diagnose test writes and deletes one small object under `probe/`.
 The startup test uses a second object for the ranged read. A process
 that stops mid-test can leave an object behind; it is small, and celld
-never reads it. celld reserves `probe/` together with `cells/`,
-`nodes/`, `node-cells/`, `fleet/`, `deploy/`, `deploy-blobs/`, `wake/`,
-and `telemetry/`, and it deletes objects under some of them, so an
-application must not write under any of these prefixes.
+never reads it.
+
+celld reserves `probe/`, `cells/`, `nodes/`, `node-cells/`, `fleet/`,
+`deploy/`, `deploy-blobs/`, `log/`, `wake/`, and `telemetry/`. celld deletes
+objects under some of these prefixes, so an application must not write under
+any of them.
 
 celld requires ranged reads for stored cell data. The startup test stops
 a node when the store ignores the `Range` header or returns incorrect
@@ -149,10 +151,13 @@ A gate holds each write response until a durability proof covers the
 write. A read-only response waits in the same way when the object has
 committed a write that no proof covers yet. An error answer waits under
 the same rule, because the message of a handler that throws can carry a
-value that the handler read. A response body that streams gets the same
-rule for each chunk, so a chunk that an object produces after the
-response head waits for a proof of the writes it can reveal. A client
-therefore cannot act on a value that a crash can still lose. After a
+value that the handler read. An R2 mutation waits for the source object's write
+proof. Therefore, the mutation cannot change the application bucket before the
+source write is durable. A raw TCP connection, write, TLS upgrade, or shutdown
+waits for the same proof. A response body that streams gets the same rule for
+each chunk, so a chunk that an object produces after the response head waits
+for a proof of the writes it can reveal. A client therefore cannot act on a
+value that a crash can still lose. After a
 bucket proof, celld reads the ownership record once and acknowledges
 only if the record still names this node at this epoch. A partitioned
 node can commit locally and replicate into its superseded prefix, but
@@ -166,6 +171,11 @@ nodes are its followers, and the set of them is the ensemble. Every
 follower must fsync the write, and a takeover seals the prior node-log
 session before it restores, so the stale owner cannot complete another
 fleet proof.
+
+An unfinished SQL write cursor can return rows before SQLite commits the
+write. Outside an explicit transaction, the application must consume those
+rows before output or `storage.sync()`, so the gate can cover the commit.
+celld rejects that output while the write cursor remains unfinished.
 
 ### The ensemble needs two nodes
 
@@ -207,8 +217,13 @@ together can recover acknowledged writes from their surviving follower disks.
 The node accepts application requests and new follower appends only after
 startup completes.
 
-A large dead node can hold this recovery open for minutes. A recovery
-attempt that fails or times out does not fail the waiting requests.
+A large dead node can hold this recovery open for minutes. The recovery
+reads the retained bundles in windows of at most 512 MiB. It uploads the
+rows of one window and releases them before it reads the next window, so
+the memory of the recovery does not grow with the size of the session. A
+cell that has rows in several windows receives one object for each window.
+A recovery attempt that fails or times out does not fail the waiting
+requests.
 The cell waits, and it retries the activation with a backoff
 (`CELLD_RECOVERY_RETRY_MS`, default 1000). The requests fail with a
 resolve error only after the retry budget is spent
@@ -264,6 +279,17 @@ ownership records. And a request is safe even before the fence runs,
 because celld compares the current time against the published expiry
 each time it routes a request.
 
+An ingress checks a cached remote route against its observed lease deadline
+for each new request. At the deadline, the ingress reads ownership again,
+even if the previous owner keeps its connections open without a response.
+Recovery still needs the bucket and the required durable data.
+A draining ingress can resolve and forward to a live remote owner. It
+refuses new ownership of an unowned cell or a cell with an expired owner.
+
+A request already sent to the previous owner can remain incomplete. The
+ingress does not replay that request, because the handler can have committed
+a write before it stopped. The caller can cancel the request.
+
 A fenced node logs a line that starts with `SELF-FENCE:` and stops with
 the exit code 3. celld reports other internal failures with the same
 prefix and code, so the line names the cause. An expired lease uses the
@@ -291,3 +317,91 @@ nothing for it.
 The failure of a node is a normal input, not a recovery procedure; the
 [testing page](testing.md) shows the kill tests that exercise this
 path.
+
+## Alarm discovery and the wake format
+
+SQLite stores the alarm deadline, consumption, retry state, and installation
+identity. An alarm hint only causes celld to read SQLite. The hint does not
+authorize an alarm handler to run.
+
+Each committed alarm installation has a separate object under `wake/entries/`.
+The ownership epoch and a persistent SQLite sequence identify the installation.
+An alarm response waits for its publication PUT and the existing output proof.
+Updates within the same minute also require a new publication PUT.
+
+Cleanup uses conditional writes to publish a retirement record under
+`wake/retired/`. The record requires a durability proof, a current owner,
+and a confirmed replacement publication when an alarm remains armed.
+Cleanup deletes only older identities or a proven consumed identity.
+An old DELETE therefore cannot delete a later installation.
+This protocol requires no conditional DELETE operation from the bucket.
+After the proof, celld attempts to delete known obsolete publications directly.
+These deletions do not block an alarm response.
+
+Each cleanup pass lists at most 128 objects and processes at most eight cells
+concurrently. The next pass continues the listing, and the final page restarts
+the scan. A failed DELETE or a late PUT can require another complete scan.
+The default interval is 60 seconds. `CELLD_WAKER_TICK_MS` changes this interval
+and the due-scan interval. A large inventory can require many intervals, and
+an additional node can repeat the same reads and deletes.
+The collector requests a SQLite refresh for a remaining installation only when
+its minute is due. Future installations stay dormant until that minute.
+The timer still controls delivery, so the refresh cannot run the handler early.
+
+The `wake/format.json` object selects format 2. The `wake/waker.json` object
+holds the advisory lease for the fleet's waker role. A new node or deployment
+initializes an empty fleet or upgrades a stopped v0.4.1 fleet automatically.
+An unsupported format prevents startup. Existing application objects outside
+the reserved namespaces do not prevent initialization.
+The previous `wake-format.json`, `wake-v2/`, and `wake-retired-v2/` names
+also identify unsupported engine data and prevent fresh initialization.
+
+### Start a fleet with this format
+
+An empty fleet initializes this format automatically. An upgrade from v0.4.1
+uses the same bucket and preserves the existing node data directories.
+The upgrade requires a stopped fleet. Mixed versions cannot share a serving
+fleet because v0.4.1 cannot read the new alarm discovery entries.
+
+1. Stop application traffic and deployment writers. Stop every old node and
+   its supervisor, then wait for every node lease to expire.
+2. Back up the stopped fleet's bucket and node data. Keep the node names,
+   peer addresses, and data directories for the restart. A follower disk can
+   contain acknowledged writes that the bucket does not yet contain.
+3. Prevent the old binaries from restarting or writing to the bucket.
+   Revoke their credentials or remove their access through the deployment
+   system. The format marker cannot stop an old binary from writing.
+4. Start the new binary on every node with the same configuration, data, and
+   addresses. Wait for the fleet to become healthy before resuming traffic.
+
+Startup upgrades the format automatically. The nodes can start together and
+complete the same migration. A live node lease prevents the migration, so
+stop every old writer and wait for its lease to expire before the restart.
+The operator must prevent old writers from returning after the upgrade.
+
+The migration inventories stored cells and creates a discovery seed for each
+cell. It preserves the databases, node logs, ownership records, deployments,
+and application objects. Existing legacy wake entries remain unused.
+The inventory uses pages of at most 128 entries and includes cells whose
+old alarm discovery entry is missing.
+
+A discovery seed makes recovery read the cell's SQLite alarm state. Recovery
+creates the installation identity without changing the deadline or retry
+state. A seed does not authorize an alarm handler to run. The normal
+retirement proof removes the seed after durable recovery and replacement
+discovery, so an interrupted migration cannot silently discard an alarm.
+Recovery can load cells with future alarms while it processes these seeds.
+
+If a node stops during the migration, another starting node resumes it.
+The nodes cannot serve until the complete inventory succeeds. Later starts
+use the completed format without another migration. Alarms can run late
+during the outage.
+
+Do not roll back by starting an old binary against the upgraded fleet.
+Restore the complete stopped-fleet backup for a rollback. That restoration
+loses writes made after the backup, so preserve those writes separately.
+
+Normal restarts and ownership transfers within this format preserve the
+alarm history. Each restored writer takes a new ownership epoch and keeps
+the stored sequence and consumed state, so an old mutation cannot target
+a later installation.

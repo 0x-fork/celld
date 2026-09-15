@@ -10,6 +10,12 @@ nodes, and the operators. Application code can use its configured bindings and
 can consume shared node resources. Do not run code from mutually distrusting
 tenants in one fleet.
 
+The engine's host functions are not reachable from application code. An
+internal script receives them as function parameters, so a bundle cannot name
+a host function, and `globalThis` carries no `__`-prefixed property. A worker
+that the Worker Loader loads with `globalOutbound: null` therefore reaches the
+host only through the capabilities in its `env`.
+
 celld depends on two external security boundaries:
 
 - A trusted private network protects the internal listener. Use an encrypted

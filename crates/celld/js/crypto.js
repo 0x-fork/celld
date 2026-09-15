@@ -115,7 +115,7 @@
   // echoes the request's hash string fails with a TypeError. The host
   // parses every asymmetric key, so its details are the source here.
   //
-  // `algorithm` is the caller's request, or null when there is none — a
+  // `algorithm` is the caller's request, or null when there is none -- a
   // node:crypto KeyObject crossing to Web Crypto has only the parsed key.
   // RSA is the one algorithm whose hash the key itself does not carry, so
   // the request is the only source for it and a missing one means SHA-256.
@@ -797,17 +797,5 @@
   // a second one by hand, which drifted: it named every EC curve P-256 and
   // left the exponent off an RSA key. The loop below hides this name, and
   // the module is lazy, so it always resolves after this script runs.
-  globalThis.$$keyAlgorithm = _keyAlgorithm;
+  __celld.$$keyAlgorithm = _keyAlgorithm;
 })();
-
-// Last harness script, so this sees every internal the others declared.
-// Runtime plumbing must not show up in `for (const k in globalThis)`: a
-// bundle walking the globals should find the Web platform and nothing
-// else. Host ops are already non-enumerable; these are the JS-side ones.
-for (const n of Object.getOwnPropertyNames(globalThis))
-  if (n.startsWith("__") || n.startsWith("$$"))
-    // A top-level `function` declaration is non-configurable, so a
-    // couple of harness helpers cannot be hidden. Harmless: a walker
-    // sees a function either way.
-    try { Object.defineProperty(globalThis, n, { enumerable: false }); }
-    catch { /* non-configurable */ }

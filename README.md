@@ -54,6 +54,8 @@ Durable Object. Each row links to a project that deploys as-is:
 | Workflows: durable steps, sleeps, events, pause and restart | [`workflow`](examples/workflow) |
 | Cron Triggers: one run for each occurrence across the fleet | [`cron`](examples/cron) |
 | Static assets: asset-only or with a Worker, `_headers`, `_redirects` | [docs](docs/cloudflare-compat.md#static-assets) |
+| Containers (experimental): a Durable Object that supervises a container, `@cloudflare/containers` | [`container`](examples/container) |
+| Sandboxes: the Cloudflare Sandbox SDK, `@cloudflare/sandbox`, on a container per sandbox | [`sandbox`](examples/sandbox) |
 
 A product that needs the Cloudflare network, a GPU, or a browser farm is out
 of scope. The [Cloudflare compatibility](docs/cloudflare-compat.md) page
@@ -216,6 +218,13 @@ deployment objects directly, using the documented types in
 `crates/celld/protocol.rs`. Every node discovers owners and peers from
 bucket leases; there is no account or join service. Run `celld --help` for
 the complete command line.
+
+An upgrade from v0.4.1 preserves the existing bucket and node data directories.
+Stop all old nodes, then start the new binaries with the same configuration.
+Startup upgrades the wake format automatically before a node serves traffic.
+Mixed versions cannot share a serving fleet.
+The [wake format contract](docs/guarantees.md#start-a-fleet-with-this-format)
+describes the startup checks and the boundary for existing fleet data.
 
 Peer HTTP and the operator API use the internal listener. Put every
 advertised address on a trusted private network or an encrypted overlay such

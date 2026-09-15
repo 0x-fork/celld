@@ -48,6 +48,10 @@ pub struct ActivitySnapshot {
     /// Balancing moves no peer acquired. A subset of `handoff_failed`; the
     /// cell stayed unowned and its next request re-reads ownership.
     pub rebalance_failed: u64,
+    /// Cached owner or capacity routes retired after an observed lease
+    /// deadline. Counts one per retirement, including healthy renewals;
+    /// lease-less adoption replies and explicit invalidations do not count.
+    pub remote_route_refreshes: u64,
 }
 
 /// Management-facing lifecycle state derived atomically from [`State`].
@@ -233,6 +237,26 @@ pub struct CapacityPeer {
     pub draining: bool,
 }
 
+impl CapacityPeer {
+    /// Whether this peer's own load report leaves room for another cell.
+    ///
+    /// The rebalance planner and the handoff executor must return the same
+    /// answer here, so both read this one predicate. The planner counts a
+    /// peer's room before it releases a batch, and the executor offers each
+    /// released cell only to a peer that has room. A peer the planner counts
+    /// and the executor then refuses leaves the cell unowned with its epoch
+    /// retained, because the release CAS runs before the successor acquire
+    /// and nothing puts the record back.
+    ///
+    /// A saturated ingress-only node is the case that breaks a split rule.
+    /// It owns no cells, so it looks like the emptiest receiver in the
+    /// fleet and the planner gives it the largest room, while the executor
+    /// refuses every cell it is offered.
+    pub fn reports_adoption_capacity(&self) -> bool {
+        !self.pressured && self.memory_headroom != Some(false)
+    }
+}
+
 /// A successor that has acquired a released cell.
 ///
 /// The executor obtains this only from a signed peer acknowledgement. The
@@ -409,6 +433,10 @@ pub enum Channel {
     Service,
     /// A call to another cell: its `fetch` or one of its RPC methods.
     CellRpc,
+    /// An operation that changes an application R2 bucket.
+    R2,
+    /// A connection, write, TLS upgrade, or shutdown on a raw TCP socket.
+    Tcp,
     /// A leased Queue batch leaving its broker for a consumer Worker.
     Queue,
     /// The promise `storage.sync()` returns to the handler. Nothing leaves
@@ -431,6 +459,8 @@ impl Channel {
             Channel::WsSelf => "ws_self",
             Channel::Service => "service",
             Channel::CellRpc => "cellrpc",
+            Channel::R2 => "r2",
+            Channel::Tcp => "tcp",
             Channel::Queue => "queue",
             Channel::Sync => "sync",
         }
@@ -676,7 +706,7 @@ pub enum Event {
     },
     AlarmObserved {
         cell: CellId,
-        at_ms: Option<i64>,
+        alarm: wake::AlarmSnapshot,
         covered: bool,
         now_ms: u64,
         now_mono_ms: u64,
@@ -696,7 +726,7 @@ pub enum Event {
         /// covers it, and the position of the consuming commit if the firing
         /// wrote. The position is sampled last, so it covers the consume
         /// itself, and the core proves it durable before the alarm settles.
-        result: Result<(Option<i64>, bool, Option<u64>), Failure>,
+        result: Result<(wake::AlarmSnapshot, bool, Option<u64>), Failure>,
     },
     /// A due wake entry was found for `cell`. `entry_ms` is the minute the
     /// entry is filed under, so the node that acts on the hint can adopt
@@ -939,20 +969,11 @@ pub enum Effect {
     /// Emitted wherever the alarm settles, which is the only place that
     /// knows. An arm needs an entry; a consumed alarm needs its entry gone,
     /// or every later due scan finds a hint for an alarm that already fired
-    /// and wakes a cell with nothing to do. `next_alarm_ms` is -1 when no
-    /// alarm remains.
+    /// and wakes a cell with nothing to do. The snapshot retains its source
+    /// revision through the proof that permits this effect.
     ReconcileWakeEntry {
         cell: CellId,
-        next_alarm_ms: i64,
-    },
-    /// Take responsibility for the wake entry a hint came from, filed under
-    /// `entry_ms`. Emitted only when the core acts on the hint: the node that
-    /// activates the cell must know the entry so its consume deletes it, and
-    /// a node that does not act must not learn about a cell it never
-    /// resolves, or the fleet's whole due set accumulates in its flusher.
-    AdoptWakeEntry {
-        cell: CellId,
-        entry_ms: i64,
+        alarm: wake::AlarmSnapshot,
     },
     /// Publish an evicted cell as unowned, keeping its epoch, so the next
     /// node to want it can take it without waiting for this one to notice.
@@ -1012,6 +1033,24 @@ pub enum Effect {
         op: OpId,
         cell: CellId,
         epoch: Epoch,
+        /// Whether a request that arrives during this proof puts the cell back
+        /// into service instead of waiting for a successor. The cell still
+        /// serves while the proof runs, so an arriving request can cancel the
+        /// eviction. A revocable proof is therefore the last point at which
+        /// the node can change its mind, so the shell finishes every remote
+        /// check it needs here rather than after it takes close exclusion. A
+        /// drain has nowhere to put the cell back, so it pays for no check it
+        /// does not need.
+        ///
+        /// The two cancel sites do not test the same thing, which is worth
+        /// knowing before either one changes. `request_authorized` refuses to
+        /// rescue a cell while the node drains. `worker_request` cancels an
+        /// `EnsuringDurability` eviction with no drain test at all. That
+        /// asymmetry is safe only because a drain sets this field false: the
+        /// shell then does no revocable work, so a rescue costs a cancelled
+        /// proof and nothing more, and `LtxRepl::evict` remains the final
+        /// authority on whether the cell may be given up.
+        revocable: bool,
     },
     /// The output gate: prove the cell's committed `position` is replicated so
     /// a withheld local write response can be released. Unlike
@@ -1042,6 +1081,25 @@ pub enum Effect {
         /// ends, because their node is leaving; an eviction on a serving
         /// node is not worth a cell that never answers again.
         bounded: bool,
+    },
+    /// Give the cell back instead of finishing this eviction stop.
+    ///
+    /// A request is waiting on a cell in `Phase::Cleaning`, and the stop that
+    /// holds it is a bounded eviction, so the node has somewhere to put the
+    /// cell back. The shell abandons the stop if it can still do so, and it
+    /// reports `RuntimeStopFailed`, which restarts the cell on its open
+    /// database at the epoch it already had.
+    ///
+    /// The shell decides whether it is still able to. An eviction that has
+    /// made its handoff snapshot visible cannot be abandoned: the snapshot is
+    /// a full image at one txid and it is the successor's restore artifact, so
+    /// a cell that served past it would leave a later restore reading a
+    /// complete database that stops short of an acknowledged write. This
+    /// effect is therefore a request and not an instruction, and a stop that
+    /// declines it reports `RuntimeStopped` as before.
+    AbandonEvictionStop {
+        op: OpId,
+        cell: CellId,
     },
     FireAlarm {
         op: OpId,

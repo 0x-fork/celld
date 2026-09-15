@@ -19,6 +19,11 @@ supports, one service or API at a time:
 - `cron/` — a cron trigger that logs each tick
 - `workflow/` — a Workflow that builds a report in one durable step
 - `rpc/` — Durable Object method calls through JS RPC
+- `facets/` — a Durable Object facet over a class the Worker Loader starts
+- `container/` — a Durable Object that supervises a container with
+  `@cloudflare/containers`; needs `npm install` and a Docker or Podman CLI
+- `sandbox/` — the Cloudflare Sandbox SDK: commands, files, and processes
+  in a container per sandbox; needs `npm install` and a Docker or Podman CLI
 - `pi/` — the PiHarness agent loop in a Durable Object
 - `opencode/` — the OpenCode Workerd SDK in a Durable Object
 - `wasm/` — a Durable Object counter in Rust, compiled to Wasm with

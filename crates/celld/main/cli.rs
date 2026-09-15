@@ -19,10 +19,6 @@ pub(crate) struct Settings {
     /// Whether forwarded scheme and host headers can set `request.url`.
     /// This option is off unless a trusted proxy replaces both headers.
     pub(crate) trust_forwarded_headers: bool,
-    /// Whether a node tests the bucket's conditional writes and ranged reads
-    /// before it serves. On by default, because a store that mishandles either
-    /// operation cannot safely serve cell data.
-    pub(crate) storage_probe: bool,
     /// Set only by the `celld dev` supervisor for its child node. No fleet
     /// flag or public environment variable selects the local backend.
     pub(crate) dev_store: Option<std::path::PathBuf>,
@@ -152,7 +148,6 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         advertise: configured_advertise,
         unsafe_public_advertise: celld::env_vars::flag("CELLD_UNSAFE_PUBLIC_ADVERTISE", false)?,
         trust_forwarded_headers: celld::env_vars::flag("CELLD_TRUST_FORWARDED_HEADERS", false)?,
-        storage_probe: celld::env_vars::flag("CELLD_STORAGE_PROBE", true)?,
         dev_store: if diagnose {
             None
         } else {
@@ -338,27 +333,18 @@ ENVIRONMENT:
   CELLD_WATCH                     Local SQLite/replication working directory
   CELLD_ESBUILD                   Override esbuild executable path
   CELLD_ACTIVATIONS               Concurrent cold activations
-  CELLD_EVICTIONS                 Concurrent evictions (default: 4)
-  CELLD_VARS_FILE, CELLD_VAR_*    Worker variable overrides
   CELLD_ASSET_CACHE_DIR           Downloaded static-asset cache directory
   CELLD_ASSET_CACHE_BYTES         Asset cache limit
 
 TUNING:
-  CELLD_STORAGE_PROBE             `0` skips the startup storage-contract test
-                                  (default: on)
   CELLD_TTL_MS                    Node lease lifetime (default: 10000)
   CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
-  CELLD_SHUTDOWN_DRAIN_MS         Shutdown handoff no-progress interval (default: 25000)
   CELLD_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: {shutdown_total_ms})
-  CELLD_DRAIN_TOKEN_WAIT_MS       Drain-token wait before an unserialized
-                                  handoff; at most {token_wait_numerator}/{token_wait_denominator} of the complete
-                                  stop bound (default: {drain_token_wait_ms}; 0 disables)
+                                  Internal shutdown waits scale with this bound
   CELLD_READY_FLEET_GATE_MS       First-readiness wait for fleet capacity
                                   (default: 120000; 0 disables)
   CELLD_REBALANCE_INTERVAL_MS     Ownership balancing sample interval
                                   (default: 5000; 0 disables)
-  CELLD_REBALANCE_BATCH_CELLS     Idle cells one balancing batch moves
-                                  (default: 32)
   CELLD_PLACEMENT_WEIGHT          Relative ownership share (default: the
                                   CPU count)
   CELLD_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)
@@ -376,35 +362,19 @@ TUNING:
   CELLD_FETCH_TIMEOUT_S           Outbound fetch timeout
   CELLD_HANDLER_BUDGET_S          JavaScript handler budget
   CELLD_TOKIO_THREADS             Tokio runtime worker threads
-  CELLD_OUTPUT_GATE               `0` removes the durability wait from writes
   CELLD_DURABILITY                `fleet` acks when every follower holds the
                                   write on disk, or when the bucket upload
                                   wins, and uploads behind either way; needs
                                   2+ nodes, else every ack waits for the
                                   bucket and writes are much slower
                                   (default: `fleet`; `bucket` always waits)
-  CELLD_LOG_CAPTURE_WORKERS       Concurrent log-capture workers (default: 8)
   CELLD_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
-  CELLD_LOG_GROUP_COMMIT_MS       Queue group-commit wait (default: 1 ms; 0 disables)
   CELLD_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
   CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)
   RUST_LOG                        Runtime log filter (default: info)
 
-EXPERIMENTAL:
-  CELLD_WORKER_LOADER             Worker Loader binding name for Code Mode
-  CELLD_AI_BINDING, CELLD_AI_URL  AI binding name and endpoint
-
 Documentation: https://celld.dev/docs"#,
         shutdown_total_ms = celld::env_vars::DEFAULT_SHUTDOWN_TOTAL_MS,
-        drain_token_wait_ms = celld::env_vars::DEFAULT_DRAIN_TOKEN_WAIT_MS,
-        token_wait_numerator = celld::env_vars::MAX_DRAIN_TOKEN_WAIT_NUMERATOR,
-        token_wait_denominator = celld::env_vars::MAX_DRAIN_TOKEN_WAIT_DENOMINATOR,
     );
     celld::cli_output::Output::new(celld::cli_output::Format::Text).help(&help)
-}
-
-pub(crate) fn worker_loader_binding() -> Option<String> {
-    std::env::var("CELLD_WORKER_LOADER")
-        .ok()
-        .filter(|name| !name.is_empty())
 }

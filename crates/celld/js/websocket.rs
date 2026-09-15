@@ -1092,11 +1092,20 @@ pub(super) fn op_ws_upgrade(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
-        return loader_throw(
-            scope,
-            "This worker is not permitted to access the internet via global functions.",
-        );
+    match &actor_runtime_state(scope).egress {
+        EgressPolicy::Allow => {}
+        EgressPolicy::Deny => {
+            return loader_throw(
+                scope,
+                "This worker is not permitted to access the internet via global functions.",
+            );
+        }
+        EgressPolicy::Broker(_) => {
+            return loader_throw(
+                scope,
+                "A globalOutbound Fetcher cannot broker WebSockets in celld.",
+            );
+        }
     }
     let id = args
         .get(0)
@@ -1204,11 +1213,20 @@ pub(super) fn op_ws_connect(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
-        return loader_throw(
-            scope,
-            "This worker is not permitted to access the internet via global functions.",
-        );
+    match &actor_runtime_state(scope).egress {
+        EgressPolicy::Allow => {}
+        EgressPolicy::Deny => {
+            return loader_throw(
+                scope,
+                "This worker is not permitted to access the internet via global functions.",
+            );
+        }
+        EgressPolicy::Broker(_) => {
+            return loader_throw(
+                scope,
+                "A globalOutbound Fetcher cannot broker WebSockets in celld.",
+            );
+        }
     }
     let id = args
         .get(0)

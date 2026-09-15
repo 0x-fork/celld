@@ -1,4 +1,4 @@
-// node:crypto for celld — a port of Workerd's implementation at commit
+// node:crypto for celld -- a port of Workerd's implementation at commit
 // 191a27f941300dd8956f2afeb66c10a651108c0b. Copyright (c) 2017-2022
 // Cloudflare, Inc. (Apache-2.0), itself adapted from Node.js (Joyent and
 // Node.js contributors, MIT). Ported files:
@@ -16,7 +16,7 @@
 // $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$randomValues /
 // $$timingSafeEqual host ops, with hash state buffered on the JS side (digest
 // runs once, at finalization).
-// checkPrime/generatePrime are pure-JS BigInt Miller–Rabin, mirroring
+// checkPrime/generatePrime are pure-JS BigInt Miller-Rabin, mirroring
 // Workerd's src/workerd/api/crypto/prime.c++ semantics (8192-bit cap, the
 // {12,11}/{24,23}/{60,59} add/rem allowlist, top-two-bits-set candidates).
 // Asymmetric key parsing/generation (PEM/DER/JWK) is not implemented; those
@@ -614,16 +614,16 @@
   const isKeyObject = (obj) =>
     obj != null && typeof obj === "object" && kHandle in obj;
 
-  // The host normalizes every accepted input to one DER — PKCS#8 for
-  // private keys, SPKI for public — and reports the type and details beside
+  // The host normalizes every accepted input to one DER -- PKCS#8 for
+  // private keys, SPKI for public -- and reports the type and details beside
   // it. Everything below reads that one shape.
   const keyOp = (operation, input) => {
     try {
       return JSON.parse(__crypto_operation(operation, JSON.stringify(input)));
     } catch (error) {
       // The host namespaces every throw with "crypto: ". node:crypto callers
-      // match on Node's own message text — `throws(fn, { message })` compares
-      // it exactly — so the namespace is stripped at this boundary.
+      // match on Node's own message text -- `throws(fn, { message })` compares
+      // it exactly -- so the namespace is stripped at this boundary.
       throw new Error(
         String(error?.message ?? error).replace(/^crypto: /, ""));
     }
@@ -654,7 +654,7 @@
     // arrives through node:crypto reports what the same key reports after
     // crypto.subtle.importKey(). There is no request dictionary here, so
     // an RSA key takes the SHA-256 that builder defaults to.
-    const algorithm = $$keyAlgorithm(
+    const algorithm = __celld.$$keyAlgorithm(
       WEB_CRYPTO_ALGORITHM[result.keyType], null, result.keyType,
       result.details);
     return KeyObject.from(
@@ -708,7 +708,7 @@
   function createSecretKey(key, encoding) {
     validateKeyData(key, "key");
     // Always copy: Buffer.from(string) may live in the shared pool, and view
-    // inputs stay owned by the caller — key material must be immutable.
+    // inputs stay owned by the caller -- key material must be immutable.
     const bytes = copyU8(
       typeof key === "string" ? Buffer.from(key, encoding) : key);
     const handle = new CryptoKey(
@@ -1365,7 +1365,7 @@
         n = n - (n % add) + rem;
         step = add;
       } else if (safe) {
-        if (n % 4n === 1n) n += 2n; // n is odd; force n ≡ 3 (mod 4)
+        if (n % 4n === 1n) n += 2n; // n is odd; force n is congruent to 3 (mod 4)
         step = 4n;
       }
       for (let i = 0; i < 4096; i++, n += step) {
@@ -1559,7 +1559,7 @@
     KeyObject, SecretKeyObject, PublicKeyObject, PrivateKeyObject,
     createSecretKey, createPrivateKey, createPublicKey,
     generateKey, generateKeySync, generateKeyPair, generateKeyPairSync,
-    // Sign/Verify, ciphers, DH, certs: not implemented — loud, not silent.
+    // Sign/Verify, ciphers, DH, certs: not implemented -- loud, not silent.
     createSign: notImplemented("createSign"),
     createVerify: notImplemented("createVerify"),
     sign, verify,
@@ -1592,11 +1592,7 @@
   };
   cryptoModule.default = cryptoModule;
 
-  Object.defineProperty(globalThis, "__cryptoModule", {
-    value: cryptoModule, configurable: true, writable: true,
-  });
+  __celld.__cryptoModule = cryptoModule;
   // node:util's types.isKeyObject checks against this class if it exists.
-  Object.defineProperty(globalThis, "__nodeKeyObjectClass", {
-    value: KeyObject, configurable: true, writable: true,
-  });
+  __celld.__nodeKeyObjectClass = KeyObject;
 })();

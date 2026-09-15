@@ -30,7 +30,7 @@ use anyhow::anyhow;
 use celld_ltx::client::epochs::EpochChain;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
-use celld_ltx::replica_compactor::ReplicaCompactor;
+use celld_ltx::replica_compactor::{CompactionResult, ReplicaCompactor};
 use celld_ltx::Db;
 use celld_ltx::HostTaskError;
 use celld_ltx::LtxHost;
@@ -51,10 +51,10 @@ use crate::asyncrt;
 use crate::replication::sqlite_snapshot;
 use crate::replication::ActivationOptions;
 use crate::replication::ActivationResult;
-use crate::replication::EvictionRestoreArtifact;
 use crate::replication::RestoredSnapshot;
 use crate::replication::StorageCredentials;
 use crate::replication::SyncWait;
+use crate::replication::{EvictionAbandon, EvictionRestoreArtifact};
 use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 
 /// Max cells uploading concurrently across the node. Caps blocking-pool threads
@@ -83,8 +83,8 @@ const RESTORE_DOWNLOAD_CONCURRENCY: usize = 64;
 /// history into memory.
 const COMPACTION_MAX_FILES: usize = 256;
 
-/// The current `ReplicaClient` interface buffers objects, so bound the complete
-/// input set until the client gains a streaming read and write surface.
+/// Bound buffered source data. An indivisible object above this budget uses
+/// scratch files and bounded range reads instead of stalling the level.
 const COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One captured-but-not-yet-uploaded L0 segment, the log tier's
@@ -179,41 +179,6 @@ pub trait Shipper: Send + Sync + 'static {
     fn epoch(&self) -> u64;
 }
 
-/// The bundle sink (`crate::node_log`): one PUT per node per flush
-/// interval, carrying every dirty cell's captured L0 segments verbatim
-/// (`crate::bundle`). `true` means the bundle is durable in the bucket and
-/// every included frame may credit its cell's bucket coverage. Inactive
-/// (or absent) means the per-cell upload path owns tiering, exactly as
-/// before bundles existed.
-pub trait BundleSink: Send + Sync + 'static {
-    fn put_bundle<'a>(
-        &'a self,
-        entries: Vec<celld_ltx::bundle::BundleEntry>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
-    fn active(&self) -> bool;
-    /// The un-drained rows for one cell-epoch, from the leader's own
-    /// index of the bundles it wrote. Empty when bundles are off.
-    fn rows_for(&self, cell: &str, epoch: u64) -> Vec<celld_ltx::LocatedRow>;
-    /// One bundle object's complete bytes, for slicing rows out of.
-    fn fetch_bundle<'a>(
-        &'a self,
-        source: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a>>;
-
-    /// Fold one cell's stranded tail into the per-cell layout —
-    /// recovery's gather, scoped to one cell, over both places the tail
-    /// can live: this node's retained bundles and the live members'
-    /// fragments. The successor of a quiet ending calls this before it
-    /// restores, because restores read per-cell prefixes only and the
-    /// takeover law requires the acked prefix there (#473). Idempotent:
-    /// every upload is a PUT to the exact key the leader's own drain
-    /// would have used.
-    fn fold_cell<'a>(
-        &'a self,
-        cell: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
-}
-
 /// The compactor-facing fetcher: one cell-epoch's view over whatever sink
 /// is currently installed. Reading the slot per call makes activation
 /// order irrelevant — a cell activated before the sink existed still sees
@@ -235,8 +200,8 @@ impl celld_ltx::BundleFetcher for SinkFetcher {
         >,
     > {
         Box::pin(async move {
-            let sink = registered_durability(&self.registration)
-                .and_then(|targets| targets.bundle_sink.clone());
+            let sink =
+                registered_durability(&self.registration).map(|targets| targets.manager.clone());
             Ok(sink.map_or_else(Vec::new, |sink| sink.rows_for(&self.cell, self.epoch)))
         })
     }
@@ -247,8 +212,8 @@ impl celld_ltx::BundleFetcher for SinkFetcher {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = celld_ltx::Result<Vec<u8>>> + Send + 'a>>
     {
         Box::pin(async move {
-            let sink = registered_durability(&self.registration)
-                .and_then(|targets| targets.bundle_sink.clone());
+            let sink =
+                registered_durability(&self.registration).map(|targets| targets.manager.clone());
             let Some(sink) = sink else {
                 return Err(celld_ltx::Error::Other("no bundle sink".into()));
             };
@@ -257,6 +222,23 @@ impl celld_ltx::BundleFetcher for SinkFetcher {
                 .await
                 .map_err(|e| celld_ltx::Error::Other(e.to_string().into()))?;
             Ok(celld_ltx::bundle::slice(&bytes, &located.row)?.to_vec())
+        })
+    }
+
+    fn fetch_range<'a>(
+        &'a self,
+        located: &'a celld_ltx::LocatedRow,
+        offset: u64,
+        len: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = celld_ltx::Result<Vec<u8>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let sink = registered_durability(&self.registration)
+                .map(|targets| targets.manager.clone())
+                .ok_or_else(|| celld_ltx::Error::Other("no bundle sink".into()))?;
+            sink.fetch_bundle_range(located, offset, len)
+                .await
+                .map_err(|error| celld_ltx::Error::Other(error.to_string().into()))
         })
     }
 }
@@ -268,7 +250,7 @@ struct RegisteredDurability {
 
 struct RegisteredTargets {
     shipper: Arc<dyn Shipper>,
-    bundle_sink: Option<Arc<dyn BundleSink>>,
+    manager: Arc<crate::node_log::NodeLogManager>,
 }
 
 #[derive(Default)]
@@ -499,26 +481,22 @@ impl TaskGroup {
 }
 
 pub(crate) struct LtxTaskOwner {
-    stop: StopToken,
-    roots: TaskGroup,
-    sync_tasks: TaskGroup,
-    compaction_workers: TaskGroup,
-    compaction_requeues: TaskGroup,
+    tasks: TaskGroup,
     replica_close_tasks: TaskGroup,
 }
 
 impl LtxTaskOwner {
     pub(crate) fn request_stop(&self) {
-        self.stop.request_stop();
+        self.tasks.stop.request_stop();
     }
 
     pub(crate) async fn join(&self) {
-        // Roots stop admission into every dynamic group. Workers can create
-        // delayed requeues, so join workers before the requeue group.
-        self.roots.join().await;
-        self.sync_tasks.join().await;
-        self.compaction_workers.join().await;
-        self.compaction_requeues.join().await;
+        // Roots and their descendants share admission and completion tracking.
+        // Once stopped, no successor can enter; joining this group therefore
+        // needs no ordering between sync, compaction, and delayed requeues.
+        self.tasks.join().await;
+        // Release closes remain admissible after background work stops, until
+        // shutdown seals their separate admission gate.
         self.replica_close_tasks.join().await;
     }
 }
@@ -542,10 +520,8 @@ impl Drop for DurabilityRegistration {
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionConfig {
     pub min_txids: u64,
-    /// L0 bytes since the last fold that queue one on their own, whatever
-    /// the txid distance: a whale's 1 MB rows fill the fold's input cap in
-    /// far fewer txids than a small cell's, and a tail past the cap folds
-    /// never (`CELLD_LTX_COMPACTION_MIN_MB`).
+    /// L0 bytes since the last fold that queue one independently of the txid
+    /// distance, so large rows do not accumulate a long uncompacted tail.
     pub min_bytes: u64,
     pub concurrency: usize,
 }
@@ -567,6 +543,8 @@ struct CellCompaction {
     queued: AtomicBool,
     cancelled: AtomicBool,
     cancel: Notify,
+    #[cfg(all(test, celld_internal_tests))]
+    finish_pause: Mutex<Option<Arc<CompactionFinishPauseForWorld>>>,
     /// Serializes threshold compaction with the final handoff snapshot. The
     /// handoff path cancels background work, then waits here before it reads
     /// the quiesced database image.
@@ -716,6 +694,16 @@ struct Cell {
     fleet_credit_receipts: Mutex<Vec<LtxFleetCreditReceiptForWorldV1>>,
 }
 type CellHandle = Arc<Cell>;
+
+/// Both direct L0 drains and L1 folds publish per-cell coverage. Reading only
+/// the direct watermark makes recovery re-upload rows that L1 already holds.
+fn percell_coverage(handle: &Cell) -> u64 {
+    handle.percell_txid.load(Ordering::SeqCst).max(
+        handle.compaction.as_ref().map_or(0, |compaction| {
+            compaction.compacted_txid.load(Ordering::SeqCst)
+        }),
+    )
+}
 
 /// A capture covering tickets up to `captured` has begun for this cell. Only
 /// a capture that reaches new tickets moves the start: a retry of the same
@@ -1094,10 +1082,7 @@ impl LtxRepl {
         let dirty_ship = Arc::new(Notify::new());
         let registration: Arc<Mutex<RegistrationState>> = Arc::default();
         let stop = StopToken::new();
-        let roots = TaskGroup::new(stop.clone());
-        let sync_tasks = TaskGroup::new(stop.clone());
-        let compaction_workers = TaskGroup::new(stop.clone());
-        let compaction_requeues = TaskGroup::new(stop.clone());
+        let tasks = TaskGroup::new(stop.clone());
         let replica_close_stop = StopToken::new();
         let replica_close_tasks = TaskGroup::new(replica_close_stop.clone());
         let preserved = Mutex::new(crate::replication::PreservedCache::new(
@@ -1106,7 +1091,7 @@ impl LtxRepl {
         // Retain every root until the unique durability owner claims them.
         // Dropping a task handle detaches the task, so a cloneable replicator
         // cannot be the final lifecycle capability.
-        roots.spawn_owned(
+        tasks.spawn_owned(
             "ltx_sync",
             sync_loop(
                 cells.clone(),
@@ -1114,32 +1099,26 @@ impl LtxRepl {
                 Arc::new(Semaphore::new(sync_concurrency())),
                 registration.clone(),
                 stop.clone(),
-                sync_tasks.clone(),
+                tasks.clone(),
                 flush_ms,
             ),
         );
-        roots.spawn_owned(
+        tasks.spawn_owned(
             "ltx_ship",
             ship_loop(
                 cells.clone(),
                 dirty_ship.clone(),
                 registration.clone(),
                 stop.clone(),
+                crate::queue_batching::timing().log_ms,
             ),
         );
-        roots.spawn_owned(
+        tasks.spawn_owned(
             "ltx_bundle",
             bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
         );
-        let compaction_queue = compaction.map(|config| {
-            start_compaction_loop(
-                config,
-                stop.clone(),
-                &roots,
-                compaction_workers.clone(),
-                compaction_requeues.clone(),
-            )
-        });
+        let compaction_queue =
+            compaction.map(|config| start_compaction_loop(config, tasks.clone()));
         Self {
             watch: watch.to_path_buf(),
             timestamp_metadata_key,
@@ -1157,7 +1136,7 @@ impl LtxRepl {
             failed_release_closes: Arc::new(Mutex::new(BTreeSet::new())),
             replica_close_stop,
             replica_close_tasks: replica_close_tasks.clone(),
-            tasks: roots.clone(),
+            tasks: tasks.clone(),
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
             compaction_queue,
@@ -1184,11 +1163,7 @@ impl LtxRepl {
             registration,
             stop: stop.clone(),
             task_owner: Mutex::new(Some(LtxTaskOwner {
-                stop,
-                roots,
-                sync_tasks,
-                compaction_workers,
-                compaction_requeues,
+                tasks,
                 replica_close_tasks,
             })),
             #[cfg(celld_internal_tests)]
@@ -1257,20 +1232,32 @@ impl LtxRepl {
         }))
     }
 
-    /// Install one fleet shipper and its optional bundle sink as one unit.
+    /// Install the manager's shipping and bundle operations as one unit.
     ///
-    /// Fleet-durable proofs begin only after the log record is open in the
-    /// bucket, so the caller guarantees that order. The registration stores
+    /// The shipper gates fleet proofs on its open bucket log record.
+    /// Registration can precede that opening. The registration stores
     /// weak references because the manager already owns this replicator.
     pub(crate) fn register_durability(
         &self,
-        shipper: Arc<dyn Shipper>,
-        bundle_sink: Option<Arc<dyn BundleSink>>,
+        manager: Arc<crate::node_log::NodeLogManager>,
     ) -> Option<DurabilityRegistration> {
-        let targets = Arc::new(RegisteredTargets {
-            shipper,
-            bundle_sink,
-        });
+        self.register_targets(RegisteredTargets {
+            shipper: manager.clone(),
+            manager,
+        })
+    }
+
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn register_durability_for_world(
+        &self,
+        manager: Arc<crate::node_log::NodeLogManager>,
+        shipper: Arc<dyn Shipper>,
+    ) -> Option<DurabilityRegistration> {
+        self.register_targets(RegisteredTargets { shipper, manager })
+    }
+
+    fn register_targets(&self, targets: RegisteredTargets) -> Option<DurabilityRegistration> {
+        let targets = Arc::new(targets);
         let mut state = self.registration.lock().unwrap();
         // Shutdown publishes stop before it clears this slot under the same
         // mutex. A registration that linearizes first is cleared by shutdown;
@@ -1333,7 +1320,7 @@ impl LtxRepl {
             .lock()
             .unwrap()
             .get(&key)
-            .map(|handle| handle.percell_txid.load(Ordering::SeqCst));
+            .map(|handle| percell_coverage(handle));
         let known = self.covered_by_cell.lock().unwrap().get(&key).copied();
         if let Some(covered) = resident.max(known).filter(|covered| *covered > 0) {
             return covered;
@@ -1359,6 +1346,36 @@ impl LtxRepl {
         let mut covered = self.covered_by_cell.lock().unwrap();
         let entry = covered.entry((cell.to_string(), epoch)).or_insert(0);
         *entry = (*entry).max(txid);
+    }
+
+    /// Highest contiguous TXID prefix proved by the live per-cell L0/L1 objects.
+    ///
+    /// Unlike `covered_txid`, this is an activation safety proof. A maximum
+    /// past a hole cannot seed a replica because doing so would preserve the
+    /// hole forever. Store errors also fail the proof instead of becoming zero.
+    /// A zero would claim that the local directory can replay the complete
+    /// epoch even though the store did not provide the required durable bound.
+    async fn contiguous_covered_txid(&self, cell: &str, epoch: u64) -> anyhow::Result<u64> {
+        let client = self.client_for(cell, epoch);
+        let mut files = Vec::new();
+        for level in 0..=1 {
+            files.extend(
+                client
+                    .ltx_files(level, TXID(0))
+                    .await
+                    .map_err(|error| anyhow!("list {cell} e{epoch} L{level}: {error}"))?,
+            );
+        }
+        files.sort_unstable_by_key(|file| (file.min_txid.0, file.max_txid.0));
+
+        let mut covered = 0_u64;
+        for file in files {
+            if file.min_txid.0 > covered.saturating_add(1) {
+                break;
+            }
+            covered = covered.max(file.max_txid.0);
+        }
+        Ok(covered)
     }
 
     pub async fn upload_raw_l0(
@@ -1579,6 +1596,10 @@ impl LtxRepl {
             .then(|| previous.and_then(first_present))
             .flatten();
 
+        // Sample before a restore can replace the path. A non-certified live
+        // database can contain rows which a crash or self-fence staged but did
+        // not upload, so its local position needs a remote bound.
+        let dst_existed = is_file(&dst);
         let mut restored = resume_local;
         let mut remote_restore = None;
         let mut paged_vfs_name: Option<String> = None;
@@ -1622,7 +1643,7 @@ impl LtxRepl {
             // truncated database as read-write (#473).
             if self.dirty_tails.lock().unwrap().contains(cell) {
                 let sink = registered_durability(&self.registration)
-                    .and_then(|targets| targets.bundle_sink.clone())
+                    .map(|targets| targets.manager.clone())
                     .ok_or_else(|| {
                         anyhow!("{cell} has an un-drained bundle tail and no bundle sink")
                     })?;
@@ -1774,21 +1795,29 @@ impl LtxRepl {
             }
         }
 
+        let remote_seed = if !restored && dst_existed {
+            Some(self.contiguous_covered_txid(cell, epoch).await?)
+        } else {
+            None
+        };
+
         // Open the managed Db (creates a fresh WAL db when nothing was restored)
         // and pair it with this epoch's client. Registration is immediate: the
         // cell can be proved durable on its very first write. The just-opened
-        // db's position is the replica's seed -- 0 for a fresh cell, the
-        // restored max otherwise, and equal to the remote under epoch fencing --
-        // so the first sync skips the `calc_pos` listing that otherwise storms a
-        // rate-limiting store. On the rare decode error we leave it unseeded and
-        // fall back to that listing.
+        // db's position is the replica's candidate seed -- 0 for a fresh cell
+        // and the restored max for a proved image. An uncertified reused image
+        // is clamped to its remote contiguous prefix above. The first sync can
+        // therefore skip the `calc_pos` listing that otherwise storms a
+        // rate-limiting store without skipping a staged local row. On the rare
+        // decode error, proved images fall back to that listing and uncertified
+        // images fail closed because their local bound is unknown.
         let db_open_started_mono_ms = asyncrt::mono_ms();
         let dst_ = dst.clone();
         let ltx_host = self.ltx_host.clone();
         // The paged VFS (this activation) takes precedence over the fault VFS.
         let vfs_name = paged_vfs_name.clone().or_else(|| self.vfs_name.clone());
         let truncate_pages = self.truncate_pages_for_cell(cell);
-        let (db, seed, marker) = asyncrt::blocking(move || {
+        let (db, mut seed, marker) = asyncrt::blocking(move || {
             let open_db = |ltx_host: LtxHost| match vfs_name.as_deref() {
                 Some(vfs_name) => Db::open_with_host_and_vfs(&dst_, ltx_host, vfs_name),
                 None => Db::open_with_host(&dst_, ltx_host),
@@ -1815,6 +1844,14 @@ impl LtxRepl {
                 .await
                 .map_err(|error| anyhow!("upload the epoch marker for {cell} e{epoch}: {error}"))?;
             self.note_covered(cell, epoch, txid.0);
+        }
+        if let Some(covered) = remote_seed {
+            let local = seed.ok_or_else(|| {
+                anyhow!("cannot prove local replica position for {cell} epoch {epoch}")
+            })?;
+            if local.txid.0 > covered {
+                seed = Some(Pos::new(TXID(covered), 0));
+            }
         }
         let db_open_us = asyncrt::mono_ms()
             .saturating_sub(db_open_started_mono_ms)
@@ -1913,6 +1950,8 @@ impl LtxRepl {
                 queued: AtomicBool::new(false),
                 cancelled: AtomicBool::new(false),
                 cancel: Notify::new(),
+                #[cfg(all(test, celld_internal_tests))]
+                finish_pause: Mutex::new(None),
                 run: tokio::sync::Mutex::new(()),
             }),
         });
@@ -2166,6 +2205,64 @@ impl LtxRepl {
             .await
     }
 
+    /// The eviction gate: prove the cell is safe to give up, while the node
+    /// can still change its mind.
+    ///
+    /// This runs in `Phase::EnsuringDurability`. The cell still serves there,
+    /// and a request that arrives cancels the eviction and puts the cell back
+    /// into service at its own epoch. `stop_cell` then takes close exclusion,
+    /// drops the runtime, and only afterwards calls `evict`, which publishes
+    /// the handoff snapshot and asks the bucket to confirm it. A request that
+    /// arrives during that second half finds `Phase::Cleaning` and waits for a
+    /// whole reactivation at a new epoch, so every second the eviction spends
+    /// after the close is a second in which an idle sweep can still evict a
+    /// cell that traffic made live again. A revocable eviction therefore does
+    /// the remote work it can do here, where the answer can still be acted on.
+    ///
+    /// `handoff_wait` reports which mechanism proved the cell durable, and
+    /// that names the successor's restore source. A bucket proof means the
+    /// per-cell tiering is the acknowledgement path, so the objects under
+    /// `cells/<cell>/ltx/e<epoch>` are already there. Ask the bucket whether
+    /// they survived: an upload this process completed does not prove that
+    /// they did. A fleet proof means the paced shipper is active, and
+    /// `bundle_loop` then leaves the per-cell prefix untouched by design, so
+    /// that prefix is legitimately empty and an unconditional question here
+    /// would refuse every fleet-posture eviction.
+    ///
+    /// The fleet proof therefore keeps the window this closes for the bucket
+    /// proof. Moving the handoff snapshot forward would not close it: the
+    /// snapshot is a full image at one txid, `evict` publishes it as the
+    /// successor's authoritative restore artifact, and a cell that keeps
+    /// serving can commit past it. A cancelled eviction would then leave an
+    /// image in the bucket that a later restore reads as complete. The cost
+    /// of the remaining window is revocability and not durability, because
+    /// `evict` still refuses to give up state the bucket cannot restore.
+    /// Closing it needs the core to accept a request during `Phase::Cleaning`,
+    /// which is an open decision (#818). Do not read the scoping as a claim
+    /// that the fleet path needs no gate.
+    ///
+    /// A drain passes `revocable: false`. It has nowhere to put a cell back,
+    /// so the answer could change nothing, and a drain that spent one bucket
+    /// LIST per resident cell would pay for it out of its shutdown budget.
+    pub async fn handoff_gate(
+        &self,
+        cell: &str,
+        epoch: u64,
+        revocable: bool,
+    ) -> anyhow::Result<()> {
+        let proof = self.handoff_wait(cell, epoch).await?;
+        if revocable
+            && matches!(proof, celld_logic::ProofSource::Bucket)
+            && !self.epoch_replicated(cell, epoch).await
+        {
+            return Err(anyhow!(
+                "no replica objects for {cell} epoch {epoch}; refusing to \
+                 evict state the bucket cannot restore"
+            ));
+        }
+        Ok(())
+    }
+
     async fn wait_for_durability_ticket(
         &self,
         handle: &CellHandle,
@@ -2407,11 +2504,37 @@ impl LtxRepl {
         }
     }
 
+    /// Take the cell, or give it back.
+    ///
+    /// `abandon` carries the core's answer to "a request arrived for this
+    /// cell". Reading it is the whole revocable half of an eviction stop, and
+    /// where it can be read is fixed by what is already visible to a
+    /// successor:
+    ///
+    /// - Before `prepare_handoff_snapshot`, nothing remote has happened and
+    ///   the isolate turn this pass waited for can be the slow part on a
+    ///   loaded node. Abandoning here costs nothing.
+    /// - Before `publish_handoff_snapshot`, the snapshot exists only in this
+    ///   process. Abandoning here throws away one local capture.
+    /// - After that PUT there is no way back. The snapshot is a full image at
+    ///   one txid, and `restore_plan` takes the highest snapshot at or below
+    ///   its target and then extends it only with the per-cell files above it.
+    ///   A resumed cell commits past that txid, and under a fleet proof those
+    ///   rows go to node bundles and not to the per-cell prefix, so a restore
+    ///   would read the image as a complete database that stops short of an
+    ///   acknowledged write. The rows are recoverable while the node-log
+    ///   session stays open, but that is a second mechanism and not a proof,
+    ///   so this pass does not rely on it.
+    ///
+    /// The PUT and the visibility LIST therefore stay unrevocable in both
+    /// postures. A request that arrives during those two round trips still
+    /// waits for the cell to start again at a new epoch.
     pub async fn evict(
         &self,
         cell: &str,
         epoch: u64,
         preserve_local: bool,
+        abandon: Option<&crate::replication::EvictionAbandon>,
     ) -> anyhow::Result<EvictionRestoreArtifact> {
         // The runtime is closed before this pass, so the snapshot is the
         // definitive durability barrier. The paced shipper normally stores a
@@ -2427,7 +2550,19 @@ impl LtxRepl {
             .get(&(cell.to_string(), epoch))
             .cloned()
             .ok_or_else(|| anyhow!("ltx cell not resident: {cell} epoch {epoch}"))?;
+        let abandoned = || {
+            anyhow::Error::new(crate::replication::EvictionAbandoned {
+                cell: cell.to_string(),
+                epoch,
+            })
+        };
+        if abandon.is_some_and(EvictionAbandon::requested) {
+            return Err(abandoned());
+        }
         let snapshot = self.prepare_handoff_snapshot(&handle).await?;
+        if abandon.is_some_and(EvictionAbandon::requested) {
+            return Err(abandoned());
+        }
         let deadline = barrier_started_mono_ms.saturating_add(self.durability_timeout_ms);
         let mut artifact = None;
         if let Some(snapshot) = snapshot {
@@ -2520,7 +2655,7 @@ impl LtxRepl {
     fn remove_local(&self, cell: &str, epoch: u64, preserve_local: bool) {
         let removed = self.remove_active_and_record_tail(cell, epoch);
         if let Some(handle) = &removed {
-            self.note_covered(cell, epoch, handle.percell_txid.load(Ordering::SeqCst));
+            self.note_covered(cell, epoch, percell_coverage(handle));
         }
         // A paged activation's file is a sparse cache of the cut, never a
         // certified reactivation baseline, and its VFS registration ends with
@@ -2567,11 +2702,7 @@ impl LtxRepl {
             .shipped_txid
             .load(Ordering::SeqCst)
             .max(handle.durable_txid.load(Ordering::SeqCst));
-        let covered = handle.percell_txid.load(Ordering::SeqCst).max(
-            handle.compaction.as_ref().map_or(0, |compaction| {
-                compaction.compacted_txid.load(Ordering::SeqCst)
-            }),
-        );
+        let covered = percell_coverage(handle);
         if acked > covered {
             self.dirty_tails.lock().unwrap().insert(cell.to_string());
         }
@@ -2811,13 +2942,19 @@ impl LtxRepl {
             .prune(&self.watch, max_bytes)
     }
 
-    /// Close the replicator handle while retaining the live database and WAL
-    /// exactly where the local path encodes them.
-    pub fn close_for_reload(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+    /// Prove the stopped database position durable, then close the replicator
+    /// while retaining the live database and WAL at their encoded path.
+    pub async fn close_for_reload(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        // Admission is already stopped, so this capture covers the exact
+        // position that a clean reload preserves. Closing first can let the
+        // next activation trust a local position that the bucket cannot
+        // restore, and an aggregate shipper watermark cannot detect that gap.
+        self.final_durability_barrier(cell, epoch).await?;
         // A paged cell's file is a sparse cache behind a VFS this process
         // registered; the next process has neither, so it cannot resume the
         // file in place (CelldPersistencePaged.tla, `BreakReloadKeepsPaged`).
-        // Evict it: the successor pages the cell in again from the bucket.
+        // Discard it after the proof, so the successor pages the complete
+        // position in again from the bucket.
         if self.paged_vfs_name(cell, epoch).is_some() {
             self.remove_local(cell, epoch, false);
             return Ok(());
@@ -3097,46 +3234,46 @@ fn cancel_compaction(handle: &CellHandle) {
 
 fn start_compaction_loop(
     config: CompactionConfig,
-    stop: StopToken,
-    roots: &TaskGroup,
-    workers: TaskGroup,
-    requeues: TaskGroup,
+    tasks: TaskGroup,
 ) -> mpsc::UnboundedSender<CompactionWork> {
     let (queue, mut work) = mpsc::unbounded_channel::<CompactionWork>();
     let slots = Arc::new(Semaphore::new(config.concurrency));
-    roots.spawn_owned("ltx_compaction_dispatcher", async move {
-        loop {
-            let next = asyncrt::select_biased! {
-                "a stop signal that ties queued compaction work starts no new worker";
-                _ = stop.stopped() => break,
-                next = work.recv() => next,
-            };
-            let Some(work) = next else { break };
-            let permit = asyncrt::select_biased! {
-                "a stop signal that ties slot acquisition starts no new compaction";
-                _ = stop.stopped() => break,
-                permit = slots.clone().acquire_owned() => permit,
-            };
-            let Ok(permit) = permit else {
-                break;
-            };
-            let Some(cell) = work.cell.upgrade() else {
-                continue;
-            };
-            let requeues = requeues.clone();
-            workers.spawn_owned("ltx_compaction_worker", async move {
-                let _permit = permit;
-                compact_cell(
-                    cell,
-                    work.queued_at_mono_ms,
-                    "threshold",
-                    true,
-                    Some(requeues),
-                )
-                .await;
-            });
-        }
-    });
+    let stop = tasks.stop_token();
+    tasks
+        .clone()
+        .spawn_owned("ltx_compaction_dispatcher", async move {
+            loop {
+                let next = asyncrt::select_biased! {
+                    "a stop signal that ties queued compaction work starts no new worker";
+                    _ = stop.stopped() => break,
+                    next = work.recv() => next,
+                };
+                let Some(work) = next else { break };
+                let permit = asyncrt::select_biased! {
+                    "a stop signal that ties slot acquisition starts no new compaction";
+                    _ = stop.stopped() => break,
+                    permit = slots.clone().acquire_owned() => permit,
+                };
+                let Ok(permit) = permit else {
+                    break;
+                };
+                let Some(cell) = work.cell.upgrade() else {
+                    continue;
+                };
+                let requeues = tasks.clone();
+                tasks.spawn_owned("ltx_compaction_worker", async move {
+                    let _permit = permit;
+                    compact_cell(
+                        cell,
+                        work.queued_at_mono_ms,
+                        "threshold",
+                        true,
+                        Some(requeues),
+                    )
+                    .await;
+                });
+            }
+        });
     queue
 }
 
@@ -3170,6 +3307,13 @@ async fn compact_cell(
         return CompactionOutcome::Cancelled;
     }
 
+    let source_position = || {
+        (
+            handle.durable_txid.load(Ordering::SeqCst),
+            handle.percell_txid.load(Ordering::SeqCst),
+        )
+    };
+    let source_at_start = source_position();
     let queue_ms = asyncrt::mono_ms().saturating_sub(queued_at_mono_ms);
     let started = asyncrt::mono_ms();
     let compactor = ReplicaCompactor::new(&compaction.client)
@@ -3178,7 +3322,7 @@ async fn compact_cell(
         .with_local_path(&compaction.local_path)
         .with_limits(COMPACTION_MAX_FILES, COMPACTION_MAX_INPUT_BYTES)
         .with_base(TXID(compaction.base_txid));
-    let worker = compactor.compact(1);
+    let worker = compactor.compact_with_progress(1);
     tokio::pin!(worker);
     let result = if cancellable {
         asyncrt::select_biased! {
@@ -3190,8 +3334,19 @@ async fn compact_cell(
         Some(worker.as_mut().await)
     };
 
+    #[cfg(all(test, celld_internal_tests))]
+    {
+        let pause = compaction.finish_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.reached.store(true, Ordering::SeqCst);
+            pause.release.notified().await;
+        }
+    }
     let outcome = match result {
-        Some(Ok(Some(output))) => {
+        Some(Ok(CompactionResult {
+            output: Some(output),
+            ..
+        })) => {
             let info = output.info;
             compaction
                 .compacted_txid
@@ -3221,10 +3376,13 @@ async fn compact_cell(
             );
             CompactionOutcome::Advanced
         }
-        Some(Ok(None)) => {
+        Some(Ok(CompactionResult {
+            covered_txid,
+            output: None,
+        })) => {
             compaction
                 .compacted_txid
-                .store(handle.durable_txid.load(Ordering::SeqCst), Ordering::SeqCst);
+                .store(covered_txid.0, Ordering::SeqCst);
             info!(
                 event = "ltx_compaction",
                 trigger,
@@ -3235,7 +3393,8 @@ async fn compact_cell(
                 queue_ms,
                 elapsed_ms = asyncrt::mono_ms().saturating_sub(started),
                 result = "no_work",
-                "the additive LTX level is current"
+                max_txid = covered_txid.0,
+                "the additive LTX level has no visible source tail"
             );
             CompactionOutcome::Current
         }
@@ -3273,11 +3432,14 @@ async fn compact_cell(
     };
     compaction.queued.store(false, Ordering::SeqCst);
 
-    if matches!(
-        outcome,
-        CompactionOutcome::Advanced | CompactionOutcome::Current
-    ) && !compaction.cancelled.load(Ordering::SeqCst)
-    {
+    // A no-work result can mean that only old bundle metadata is missing.
+    // Its truthful coverage stays behind durable_txid, so self-requeueing
+    // would spin on the same empty listing. Preserve a publication that raced
+    // this attempt: its queue request can lose the queued CAS. Read its two
+    // watermarks after clearing queued, so a later publisher queues itself.
+    let requeue = outcome == CompactionOutcome::Advanced
+        || (outcome == CompactionOutcome::Current && source_position() != source_at_start);
+    if requeue && !compaction.cancelled.load(Ordering::SeqCst) {
         // Pace consecutive rounds for one cell: a restart with a large tail
         // otherwise drains back-to-back for minutes. The pause matches the
         // round it follows (capped), so a cell compacts at half duty cycle
@@ -3385,8 +3547,7 @@ async fn sync_loop(
         let bundling = paced
             && registered
                 .as_ref()
-                .and_then(|targets| targets.bundle_sink.as_ref())
-                .is_some_and(|sink| sink.active());
+                .is_some_and(|targets| targets.manager.bundle_active());
         let now = asyncrt::wall_ms().max(0) as u64;
         let work: Vec<CellHandle> = {
             let map = cells.lock().unwrap();
@@ -3490,9 +3651,8 @@ async fn bundle_loop(
             _ = stop.stopped() => break,
             _ = tick.tick() => {},
         }
-        let installed =
-            registered_durability(&registration).and_then(|targets| targets.bundle_sink.clone());
-        let Some(active) = installed.filter(|sink| sink.active()) else {
+        let installed = registered_durability(&registration).map(|targets| targets.manager.clone());
+        let Some(active) = installed.filter(|sink| sink.bundle_active()) else {
             continue;
         };
         let work: Vec<((String, u64), CellHandle)> = {
@@ -3598,6 +3758,7 @@ async fn ship_loop(
     dirty_ship: Arc<Notify>,
     registration: Arc<Mutex<RegistrationState>>,
     stop: StopToken,
+    group_commit_ms: u64,
 ) {
     // The truncation ledger is a core decision
     // (celld_logic::log_tier::ShipLedger): outstanding batches carry the
@@ -3618,12 +3779,7 @@ async fn ship_loop(
     let mut current: Option<Arc<dyn Shipper>> = None;
     let mut current_epoch = None;
     let mut last_submit = asyncrt::mono_ms();
-    let capture_workers = crate::env_vars::positive_or("CELLD_LOG_CAPTURE_WORKERS", 8_usize)
-        .unwrap_or(8)
-        .max(1);
-    let group_commit_ms = crate::env_vars::optional::<u64>("CELLD_LOG_GROUP_COMMIT_MS")
-        .unwrap_or(None)
-        .unwrap_or(1);
+    const CAPTURE_WORKERS: usize = 8;
     // The loop's own time ledger: idle (nothing to do), stall (admission
     // or depth closed, waiting on a round), apply, scan, capture wall,
     // submit. Emitted cumulatively about once a second; wall minus the
@@ -3726,12 +3882,10 @@ async fn ship_loop(
                 continue;
             }
         }
-        // A Queue producer commits one small transaction per API call. Give
-        // the other bounded producers one millisecond to install their
-        // tickets, so one capture and follower append can prove the group.
-        // The wait is Queue-specific: a stateless counter or D1 write gets no
-        // extra latency, and 0 restores immediate capture for an operator who
-        // prefers that trade. This preliminary scan is only a delay decision;
+        // Producer grouping shares a transaction within one Queue. This wait
+        // also gathers writes from different Queues into one fleet capture.
+        // Only pending Queue writes trigger it; other cell classes alone do
+        // not add the wait. This preliminary scan is only a delay decision;
         // the authoritative work and shipper epoch are read after the wait.
         let queue_pending = if group_commit_ms == 0 {
             false
@@ -3802,7 +3956,7 @@ async fn ship_loop(
         // the completeness check are per cell, so cross-cell order is
         // free — and the fan-out is what keeps a network disk's per-cell
         // sync latency out of the round's serial cost (#140, stage 2).
-        let workers = work.len().clamp(1, capture_workers);
+        let workers = work.len().clamp(1, CAPTURE_WORKERS);
         let mut chunks: Vec<Vec<((String, u64), CellHandle)>> =
             (0..workers).map(|_| Vec::new()).collect();
         for (index, item) in work.into_iter().enumerate() {

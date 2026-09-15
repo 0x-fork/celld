@@ -1055,7 +1055,11 @@ impl Bucket {
     ) -> anyhow::Result<ObjectPage> {
         // `PaginatedListStore` does not append the separator that
         // `ObjectStore::list` appends to a path-segment prefix.
-        let path = self.key(&format!("{}/", prefix.trim_end_matches('/')));
+        let path = if prefix.is_empty() {
+            self.key("")
+        } else {
+            self.key(&format!("{}/", prefix.trim_end_matches('/')))
+        };
         let mut result = self
             .paginated
             .list_paginated(

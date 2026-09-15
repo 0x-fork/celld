@@ -493,8 +493,10 @@ pub(super) fn op_r2_delete(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let keys = serde_json::from_str::<Vec<String>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 delete key list: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let keys = keys?;
+        await_egress_gate(gate).await?;
         let store = store()?;
         let keys = keys
             .iter()
@@ -674,11 +676,13 @@ pub(super) fn op_r2_put(
     let body = view_bytes(args.get(2));
     let request = serde_json::from_str::<PutRequest>(&args.get(3).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 put options: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let request = request?;
         let Some(body) = body else {
             return Err("R2 put: the body must be an ArrayBuffer view".to_string());
         };
+        await_egress_gate(gate).await?;
         put_once(bucket_name, key, body, request).await
     });
     rv.set(promise_for(scope, id));
@@ -907,10 +911,12 @@ pub(super) fn op_r2_put_chunk(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let chunk = view_bytes(args.get(1));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let Some(chunk) = chunk else {
             return Err("R2 put: a body chunk must be an ArrayBuffer view".to_string());
         };
+        await_egress_gate(gate).await?;
         let put = puts()
             .lock()
             .unwrap()
@@ -935,8 +941,13 @@ pub(super) fn op_r2_put_end(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let abort = args.get(1).boolean_value(scope);
-    let put = puts().lock().unwrap().remove(&put_id);
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
+        // Keep the entry registered until the proof succeeds. If the gate
+        // refuses the effect, the normal cleanup path can abort a live multipart
+        // upload instead of dropping its handle and orphaning its parts.
+        await_egress_gate(gate).await?;
+        let put = puts().lock().unwrap().remove(&put_id);
         let Some(put) = put else {
             return Err(format!("R2 streaming write {put_id} is not open"));
         };
@@ -1051,8 +1062,10 @@ pub(super) fn op_r2_mp_begin(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<PutRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart options: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let request = request?;
+        await_egress_gate(gate).await?;
         reap_uploads();
         // A multipart object carries no md5, on R2 or here, so nothing is
         // computed over parts that were never seen whole.
@@ -1137,12 +1150,14 @@ pub(super) fn op_r2_mp_part(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let part_number = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
     let bytes = view_bytes(args.get(2));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let Some(bytes) = bytes else {
             return Err(format!(
                 "R2 multipart part {part_number} of upload {upload_id} must be an ArrayBuffer view"
             ));
         };
+        await_egress_gate(gate).await?;
         let entry = uploads()
             .lock()
             .unwrap()
@@ -1200,8 +1215,12 @@ pub(super) fn op_r2_mp_complete(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let claimed = serde_json::from_str::<Vec<u32>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart part list: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let claimed = claimed?;
+        // Keep the upload reachable until the proof succeeds, so a refused
+        // completion leaves a handle that `reap_uploads` can abort.
+        await_egress_gate(gate).await?;
         let Some(entry) = uploads().lock().unwrap().remove(&upload_id) else {
             return Err(format!("R2 multipart upload {upload_id} is not open"));
         };
@@ -1274,9 +1293,21 @@ pub(super) fn op_r2_mp_abort(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let entry = uploads().lock().unwrap().remove(&upload_id);
+    let gate = uploads()
+        .lock()
+        .unwrap()
+        .contains_key(&upload_id)
+        .then(|| egress_gate_request(&event_context(scope), celld_logic::Channel::R2));
     let id =
         asyncrt::enqueue(async move {
+            // An absent upload changes nothing. A live upload stays in the
+            // registry until the proof succeeds, so a refusal cannot orphan
+            // parts by dropping its only handle.
+            let Some(gate) = gate else {
+                return Ok(String::new());
+            };
+            await_egress_gate(gate).await?;
+            let entry = uploads().lock().unwrap().remove(&upload_id);
             if let Some(entry) = entry {
                 entry.lock().await.upload.abort().await.map_err(|error| {
                     format!("R2 multipart abort of upload {upload_id}: {error}")
