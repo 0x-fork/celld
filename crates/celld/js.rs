@@ -2989,6 +2989,30 @@ thread_local! {
     static DO_ID_KEYS: RefCell<HashMap<String, [u8; 32]>> = RefCell::new(HashMap::new());
 }
 
+#[derive(Debug)]
+struct RedirectSubrequestLimit(String);
+
+impl std::fmt::Display for RedirectSubrequestLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RedirectSubrequestLimit {}
+
+fn fetch_request_error(error: &reqwest::Error) -> String {
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(limit) = source.downcast_ref::<RedirectSubrequestLimit>() {
+            return limit.0.clone();
+        }
+        let Some(next) = source.source() else {
+            return format!("fetch: {error}");
+        };
+        source = next;
+    }
+}
+
 #[doc(hidden)]
 pub mod websocket;
 pub(crate) use websocket::WebSocketService;
@@ -2998,7 +3022,7 @@ use websocket::{ws_capture_begin, ws_capture_take, ws_close_request_sockets};
 /// What an outbound effect must trail before it leaves the process.
 ///
 /// The three cases are named rather than nested inside one another because
-/// two of them once shared a representation, and that is what issue #144 was:
+/// two of them once shared a representation and lost this distinction:
 /// a reader that starts after another request committed samples the new
 /// position as its own baseline and advances nothing, so a two-state gate read
 /// it as code that owns no cell at all and let its side effect out ungated.
@@ -3742,6 +3766,128 @@ pub fn handler_budget() -> Duration {
     })
 }
 
+#[cfg(unix)]
+fn clock_nanos(clock: libc::clockid_t) -> Option<u64> {
+    // SAFETY: `clock_gettime` initializes the complete `timespec` on success,
+    // and the pointer remains valid for the call.
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    if unsafe { libc::clock_gettime(clock, time.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: The successful call above initialized `time`.
+    let time = unsafe { time.assume_init() };
+    let seconds = u64::try_from(time.tv_sec).ok()?;
+    let nanos = u64::try_from(time.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+#[cfg(unix)]
+fn platform_thread_cpu_nanos() -> Option<u64> {
+    clock_nanos(libc::CLOCK_THREAD_CPUTIME_ID)
+}
+
+#[cfg(not(unix))]
+fn platform_thread_cpu_nanos() -> Option<u64> {
+    None
+}
+
+fn thread_cpu_nanos() -> Option<u64> {
+    #[cfg(all(test, celld_internal_tests))]
+    if let Some(sample) =
+        THREAD_CPU_NANOS_SAMPLES_FOR_TEST.with(|samples| samples.borrow_mut().pop_front())
+    {
+        return sample;
+    }
+    platform_thread_cpu_nanos()
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct TargetThreadCpuClock(libc::clockid_t);
+
+#[cfg(target_os = "linux")]
+impl TargetThreadCpuClock {
+    fn current() -> Option<Self> {
+        unsafe extern "C" {
+            fn pthread_getcpuclockid(
+                thread: libc::pthread_t,
+                clock_id: *mut libc::clockid_t,
+            ) -> libc::c_int;
+        }
+        let mut clock_id = std::mem::MaybeUninit::<libc::clockid_t>::uninit();
+        // SAFETY: `pthread_self` returns the calling thread, and the output
+        // pointer remains valid for the call.
+        if unsafe { pthread_getcpuclockid(libc::pthread_self(), clock_id.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: The successful call above initialized `clock_id`.
+        Some(Self(unsafe { clock_id.assume_init() }))
+    }
+
+    fn nanos(self) -> Option<u64> {
+        clock_nanos(self.0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct TargetThreadCpuClock(libc::mach_port_t);
+
+#[cfg(target_os = "macos")]
+impl TargetThreadCpuClock {
+    fn current() -> Option<Self> {
+        // SAFETY: Both calls inspect the calling thread and transfer no
+        // ownership. The returned Mach thread port remains valid while this
+        // turn holds the execution thread.
+        Some(Self(unsafe {
+            libc::pthread_mach_thread_np(libc::pthread_self())
+        }))
+    }
+
+    fn nanos(self) -> Option<u64> {
+        let mut info = std::mem::MaybeUninit::<libc::thread_basic_info>::uninit();
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        // SAFETY: `info` has the size described by `count`, and `thread_info`
+        // initializes it completely when the call succeeds.
+        let status = unsafe {
+            libc::thread_info(
+                self.0,
+                u32::try_from(libc::THREAD_BASIC_INFO).expect("thread info flavor is positive"),
+                info.as_mut_ptr().cast::<libc::integer_t>(),
+                &mut count,
+            )
+        };
+        if status != libc::KERN_SUCCESS {
+            return None;
+        }
+        // SAFETY: The successful call above initialized `info`.
+        let info = unsafe { info.assume_init() };
+        let user_seconds = u64::try_from(info.user_time.seconds).ok()?;
+        let user_micros = u64::try_from(info.user_time.microseconds).ok()?;
+        let system_seconds = u64::try_from(info.system_time.seconds).ok()?;
+        let system_micros = u64::try_from(info.system_time.microseconds).ok()?;
+        user_seconds
+            .checked_add(system_seconds)?
+            .checked_mul(1_000_000_000)?
+            .checked_add(user_micros.checked_add(system_micros)?.checked_mul(1_000)?)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy)]
+struct TargetThreadCpuClock;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl TargetThreadCpuClock {
+    fn current() -> Option<Self> {
+        None
+    }
+
+    fn nanos(self) -> Option<u64> {
+        None
+    }
+}
+
 /// Aborts raised by an HTTP or service-binding caller disconnecting while the
 /// target runs in the stateless isolate pool. Durable Object aborts can also
 /// arrive as a reentrant `CellJob::AbortFetch`, so the abort has to be visible
@@ -4044,6 +4190,34 @@ enum WorkerOrigin {
     Dynamic,
 }
 
+type ResourceLimits = crate::WorkerInvocationLimits;
+
+fn effective_resource_limits(
+    configured: Option<ResourceLimits>,
+    invocation: Option<ResourceLimits>,
+) -> Option<ResourceLimits> {
+    let lower = |configured: Option<u32>, invocation: Option<u32>| match (configured, invocation) {
+        (Some(configured), Some(invocation)) => Some(configured.min(invocation)),
+        (configured, invocation) => configured.or(invocation),
+    };
+    let limits = ResourceLimits {
+        cpu_ms: lower(
+            configured.and_then(|limits| limits.cpu_ms),
+            invocation.and_then(|limits| limits.cpu_ms),
+        ),
+        sub_requests: lower(
+            configured.and_then(|limits| limits.sub_requests),
+            invocation.and_then(|limits| limits.sub_requests),
+        ),
+    };
+    (limits.cpu_ms.is_some() || limits.sub_requests.is_some()).then_some(limits)
+}
+
+struct CpuTurnStart {
+    thread_nanos: Option<u64>,
+    wall: Instant,
+}
+
 #[derive(Clone)]
 struct LoaderEnvRoute {
     script: String,
@@ -4102,6 +4276,11 @@ pub struct WorkerConfig {
     /// Structured-clone values and host-minted service routes that a loaded
     /// worker receives. Loader-only; empty for a normal worker.
     loader_env: Option<LoaderEnv>,
+    /// Per-invocation limits supplied with a dynamically loaded Worker.
+    /// Deployment Workers leave this empty.
+    resource_limits: Option<ResourceLimits>,
+    /// Whether a Dynamic Worker can receive a tail report sender on a fetch.
+    tail_reporting: bool,
     /// `triggers.crons` from the deployment. Empty for a loaded worker and for
     /// any script without cron triggers.
     pub crons: Vec<String>,
@@ -4156,6 +4335,54 @@ pub struct WorkerConfigOptions {
     pub compat: Compat,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TailLog {
+    timestamp: i64,
+    level: String,
+    message: Vec<String>,
+}
+
+const TAIL_LOG_LIMIT_BYTES: usize = 256 * 1024;
+
+#[derive(Default)]
+struct TailLogCapture {
+    records: Vec<TailLog>,
+    /// The serialized record bytes, including separators but excluding the
+    /// two array delimiters. The records and this measure share one lock, so
+    /// no caller can retain a record without charging it to the same budget.
+    serialized_bytes: usize,
+    /// A record that crosses the limit ends capture for this invocation.
+    /// Continuing after that record would expose later context that Workerd
+    /// omits, even when a smaller record could fit in the remaining budget.
+    full: bool,
+}
+
+#[derive(Default)]
+struct JsonByteCounter(usize);
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_bytes(value: &impl serde::Serialize) -> usize {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value).expect("TailLog serialization is infallible");
+    counter.0
+}
+
+#[cfg(all(test, celld_internal_tests))]
+fn tail_log_limit_bytes_for_test() -> usize {
+    TAIL_LOG_LIMIT_BYTES
+}
+
 impl WorkerConfig {
     pub fn new(options: WorkerConfigOptions) -> Self {
         let WorkerConfigOptions {
@@ -4208,6 +4435,8 @@ impl WorkerConfig {
             loader_bindings: Vec::new(),
             egress: EgressPolicy::Allow,
             loader_env: None,
+            resource_limits: None,
+            tail_reporting: false,
             crons: Vec::new(),
             containers: Vec::new(),
             generation: 0,
@@ -4243,6 +4472,10 @@ impl WorkerConfig {
         self
     }
 
+    fn with_tail_reporting(mut self, enabled: bool) -> Self {
+        self.tail_reporting = enabled;
+        self
+    }
     /// Every `ModuleSource::EsModule` sibling with its name, its source and
     /// its scanned external imports.
     fn es_modules(&self) -> impl Iterator<Item = (&str, &str, &modules::ExternalImports)> {
@@ -4275,6 +4508,12 @@ impl WorkerConfig {
     /// Set this Worker's ambient outbound authority (loaded workers only).
     fn with_egress(mut self, egress: EgressPolicy) -> Self {
         self.egress = egress;
+        self
+    }
+
+    /// Install the limits that every invocation of this Dynamic Worker owns.
+    fn with_resource_limits(mut self, limits: Option<ResourceLimits>) -> Self {
+        self.resource_limits = limits;
         self
     }
 
@@ -4325,6 +4564,7 @@ pub struct WorkerIsolate {
     /// first, so the lock is uncontended by construction; a `lock()` reached
     /// without that permit would be a blocking call on a tokio worker.
     isolate: v8::SharedIsolate,
+    runtime_state: Arc<ActorRuntimeState>,
     /// The one realm this isolate has: its context, and the entry `fetch`
     /// that lives in it.
     ///
@@ -4359,6 +4599,26 @@ struct Realm {
 }
 
 impl WorkerIsolate {
+    fn cpu_watchdog(
+        &self,
+        remaining: Option<Duration>,
+        declared_ms: Option<u32>,
+    ) -> Option<CpuWatchdog> {
+        CpuWatchdog::start(
+            remaining,
+            declared_ms,
+            self.isolate.thread_safe_handle(),
+            self.runtime_state.clone(),
+        )
+    }
+
+    fn initial_cpu_budget(&self) -> Option<Duration> {
+        self.runtime_state
+            .resource_limits
+            .and_then(|limits| limits.cpu_ms)
+            .map(|milliseconds| Duration::from_millis(u64::from(milliseconds)))
+    }
+
     /// Take the isolate for one turn, and make the cells it hosts reachable
     /// while it is held.
     ///
@@ -4545,6 +4805,9 @@ struct ActorRuntimeState {
     pending_puts: std::sync::Mutex<PendingPuts>,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
     egress: EgressPolicy,
+    resource_limits: Option<ResourceLimits>,
+    tail_reporting: bool,
+    script_name: String,
     event_hooks: OnceLock<EventHooks>,
     /// See [`internals`].
     internals: OnceLock<v8::Global<v8::Object>>,
@@ -4631,6 +4894,231 @@ struct ExecutionTermination {
     error: String,
     actor_scope: Option<String>,
     context_id: Option<u64>,
+}
+
+#[cfg(all(test, celld_internal_tests))]
+static CPU_FINISH_TERMINATION_FOR_TEST: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+#[cfg(all(test, celld_internal_tests))]
+fn terminate_on_cpu_finish_for_test(runtime_state: &Arc<ActorRuntimeState>, finish: usize) {
+    let previous = CPU_FINISH_TERMINATION_FOR_TEST
+        .lock()
+        .unwrap()
+        .replace((Arc::as_ptr(runtime_state) as usize, finish));
+    assert!(
+        previous.is_none(),
+        "a CPU finish termination is already armed"
+    );
+}
+
+#[cfg(all(test, celld_internal_tests))]
+fn inject_cpu_finish_termination_for_test(
+    tc: &mut v8::PinScope,
+    entry: &InFlight,
+) -> Option<String> {
+    let mut armed = CPU_FINISH_TERMINATION_FOR_TEST.lock().unwrap();
+    let (runtime_state, remaining) = armed.as_mut()?;
+    if *runtime_state != Arc::as_ptr(&entry.runtime_state) as usize {
+        return None;
+    }
+    *remaining = remaining.saturating_sub(1);
+    if *remaining != 0 {
+        return None;
+    }
+    armed.take();
+    let error = "Worker exceeded CPU limit of 10 ms".to_string();
+    *entry
+        .runtime_state
+        .termination
+        .lock()
+        .expect("termination lock poisoned") = Some(ExecutionTermination {
+        error: error.clone(),
+        actor_scope: None,
+        context_id: None,
+    });
+    tc.terminate_execution();
+    Some(error)
+}
+
+fn finish_cpu_turn(_tc: &mut v8::PinScope, entry: &InFlight) -> Result<(), String> {
+    #[cfg(all(test, celld_internal_tests))]
+    if let Some(error) = inject_cpu_finish_termination_for_test(_tc, entry) {
+        return Err(error);
+    }
+    entry.context.finish_cpu_turn()
+}
+
+/// A backstop for JavaScript that never returns to the host's exact CPU
+/// sample. Exact accounting rejects finite turns in `finish_cpu_turn`; this
+/// scheduler exists because an infinite loop has no later boundary at which
+/// that sample can run. One process-wide thread watches all isolates. A thread
+/// per turn consumed a PID under cgroup `pids.max` and paid an OS thread spawn
+/// and join for every JavaScript continuation.
+struct CpuWatchdog {
+    id: u64,
+}
+
+struct CpuWatch {
+    limit: Duration,
+    declared_ms: u32,
+    target_clock: Option<TargetThreadCpuClock>,
+    target_started: Option<u64>,
+    next_check: Instant,
+    isolate: v8::IsolateHandle,
+    runtime_state: Arc<ActorRuntimeState>,
+}
+
+#[derive(Default)]
+struct CpuWatchdogState {
+    next_id: u64,
+    watches: HashMap<u64, CpuWatch>,
+}
+
+struct CpuWatchdogService {
+    shared: Arc<(Mutex<CpuWatchdogState>, std::sync::Condvar)>,
+}
+
+static CPU_WATCHDOG_SERVICE: OnceLock<CpuWatchdogService> = OnceLock::new();
+
+fn cpu_watchdog_remaining(
+    limit: Duration,
+    started_nanos: Option<u64>,
+    current_nanos: Option<u64>,
+) -> Option<Duration> {
+    let elapsed = started_nanos
+        .zip(current_nanos)
+        .map(|(started, current)| current.saturating_sub(started))?;
+    let limit_nanos = u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX);
+    (elapsed < limit_nanos).then(|| Duration::from_nanos(limit_nanos - elapsed))
+}
+
+impl CpuWatchdog {
+    fn start(
+        limit: Option<Duration>,
+        declared_ms: Option<u32>,
+        isolate: v8::IsolateHandle,
+        runtime_state: Arc<ActorRuntimeState>,
+    ) -> Option<Self> {
+        let limit = limit?;
+        let declared_ms = declared_ms?;
+        let service = cpu_watchdog_service();
+        let target_clock = TargetThreadCpuClock::current();
+        let watch = CpuWatch {
+            limit,
+            declared_ms,
+            target_clock,
+            target_started: target_clock.and_then(TargetThreadCpuClock::nanos),
+            next_check: Instant::now() + limit,
+            isolate,
+            runtime_state,
+        };
+        let (state, wake) = &*service.shared;
+        let mut state = state.lock().unwrap();
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.watches.insert(id, watch);
+        drop(state);
+        wake.notify_one();
+        Some(Self { id })
+    }
+
+    #[cfg(all(test, celld_internal_tests))]
+    fn is_registered_for_test(&self) -> bool {
+        cpu_watchdog_service()
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .watches
+            .contains_key(&self.id)
+    }
+}
+
+impl Drop for CpuWatchdog {
+    fn drop(&mut self) {
+        let (state, wake) = &*cpu_watchdog_service().shared;
+        state.lock().unwrap().watches.remove(&self.id);
+        wake.notify_one();
+    }
+}
+
+fn cpu_watchdog_service() -> &'static CpuWatchdogService {
+    CPU_WATCHDOG_SERVICE.get_or_init(|| {
+        let shared = Arc::new((
+            Mutex::new(CpuWatchdogState::default()),
+            std::sync::Condvar::new(),
+        ));
+        let scheduler = shared.clone();
+        std::thread::Builder::new()
+            .name("celld-cpu-watchdog".to_string())
+            .spawn(move || run_cpu_watchdog_service(&scheduler))
+            .expect("spawn the process CPU watchdog");
+        CpuWatchdogService { shared }
+    })
+}
+
+fn run_cpu_watchdog_service(shared: &Arc<(Mutex<CpuWatchdogState>, std::sync::Condvar)>) -> ! {
+    let (state, wake) = &**shared;
+    let mut state = state.lock().unwrap();
+    loop {
+        let Some(next_check) = state.watches.values().map(|watch| watch.next_check).min() else {
+            state = wake.wait(state).unwrap();
+            continue;
+        };
+        let now = Instant::now();
+        if now < next_check {
+            let (next_state, _) = wake.wait_timeout(state, next_check - now).unwrap();
+            state = next_state;
+            continue;
+        }
+
+        let due = state
+            .watches
+            .iter()
+            .filter_map(|(id, watch)| (watch.next_check <= now).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in due {
+            let Some(watch) = state.watches.get_mut(&id) else {
+                continue;
+            };
+            if let Some(remaining) = cpu_watchdog_remaining(
+                watch.limit,
+                watch.target_started,
+                watch.target_clock.and_then(TargetThreadCpuClock::nanos),
+            ) {
+                watch.next_check = Instant::now() + remaining;
+                continue;
+            }
+            let watch = state.watches.remove(&id).unwrap();
+            let mut termination = watch
+                .runtime_state
+                .termination
+                .lock()
+                .expect("termination lock poisoned");
+            if termination.is_none() {
+                *termination = Some(ExecutionTermination {
+                    error: format!("Worker exceeded CPU limit of {} ms", watch.declared_ms),
+                    actor_scope: None,
+                    context_id: None,
+                });
+                drop(termination);
+                watch.isolate.terminate_execution();
+            }
+        }
+    }
+}
+
+fn cpu_watchdog_for_context(scope: &mut v8::PinScope, context: &IoContext) -> Option<CpuWatchdog> {
+    let runtime_state = actor_runtime_state(scope);
+    let declared_ms = context
+        .cpu_limit_nanos
+        .and_then(|limit| u32::try_from(limit / 1_000_000).ok());
+    CpuWatchdog::start(
+        context.remaining_cpu_budget(),
+        declared_ms,
+        scope.thread_safe_handle(),
+        runtime_state,
+    )
 }
 
 fn finish_terminated_actor_event(scope: &mut v8::PinScope, context: &IoContext) {
@@ -4806,6 +5294,95 @@ pub enum Answer {
     Ack(tokio::sync::oneshot::Sender<Result<Option<u64>>>),
     /// An alarm, which answers whatever alarm the handler left armed.
     Alarm(tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>),
+}
+
+/// The invocation data that becomes one Tail Worker event after all referenced
+/// work finishes. The response sender stays independent, so tail delivery
+/// cannot delay or replace the Dynamic Worker response.
+struct TailReportState {
+    reply: tokio::sync::oneshot::Sender<String>,
+    script_name: String,
+    event_timestamp: i64,
+    url: String,
+    method: String,
+    headers: serde_json::Map<String, serde_json::Value>,
+    response_status: Option<u16>,
+    failure: Option<TailException>,
+}
+
+/// A failure and the instant it occurred. Tail delivery can wait for
+/// `waitUntil` work, so sampling the clock when the report finishes would
+/// move the exception forward by the duration of that work.
+#[derive(serde::Serialize)]
+struct TailException {
+    timestamp: i64,
+    name: &'static str,
+    message: String,
+}
+
+impl TailException {
+    fn new(message: String) -> Self {
+        Self {
+            timestamp: crate::telemetry::now_unix_us() / 1_000,
+            name: "Error",
+            message,
+        }
+    }
+}
+
+fn tail_request_headers(
+    headers: &[(String, String)],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut normalized = serde_json::Map::new();
+    for (name, value) in headers {
+        match normalized.entry(name.to_ascii_lowercase()) {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::Value::String(value.clone()));
+            }
+            serde_json::map::Entry::Occupied(mut entry) => {
+                let serde_json::Value::String(joined) = entry.get_mut() else {
+                    unreachable!("tail request headers contain only strings");
+                };
+                joined.push_str(", ");
+                joined.push_str(value);
+            }
+        }
+    }
+    normalized
+}
+
+impl TailReportState {
+    fn record_failure(&mut self, message: String) {
+        self.failure = Some(TailException::new(message));
+    }
+
+    fn finish(self, context: &IoContext) {
+        let outcome = if self.failure.is_some() {
+            "exception"
+        } else {
+            "ok"
+        };
+        let exceptions: Vec<_> = self.failure.into_iter().collect();
+        let event = serde_json::json!([{
+            "scriptName": self.script_name,
+            "event": {
+                "request": {
+                    "cf": {},
+                    "headers": self.headers,
+                    "method": self.method,
+                    "url": self.url,
+                },
+                "response": self.response_status.map(|status| serde_json::json!({
+                    "status": status,
+                })),
+            },
+            "eventTimestamp": self.event_timestamp,
+            "logs": context.take_tail_logs(),
+            "exceptions": exceptions,
+            "outcome": outcome,
+        }]);
+        let _ = self.reply.send(event.to_string());
+    }
 }
 
 impl Answer {
@@ -5097,6 +5674,8 @@ pub struct InFlight {
     /// the reason, not only that it failed. This also records an output-gate
     /// failure after a successful handler.
     failure: Option<String>,
+    /// The report owed to the loader isolate after this invocation retires.
+    tail_report: Option<TailReportState>,
     /// The isolate this entry's ops belong to, so `abandon` can drop their
     /// resolvers without a scope to reach the isolate through.
     runtime_state: Arc<ActorRuntimeState>,
@@ -5123,6 +5702,7 @@ impl InFlight {
         // has.
         if let Some(error) = self.scope.as_deref().and_then(storage::sql_critical_error) {
             let _ = end_event_context(tc);
+            self.context.seal_wait_until();
             if self.trace.is_some_and(|trace| trace.sampled) {
                 self.failure = Some(crate::telemetry::cap_error(error.to_string()));
             }
@@ -5145,6 +5725,12 @@ impl InFlight {
                         })
                         .map_err(|error| fail_in_turn_error(error, positions))
                 });
+                if let Some(report) = &mut self.tail_report {
+                    match &read {
+                        Ok(response) => report.response_status = Some(response.status),
+                        Err(error) => report.record_failure(format!("{error:#}")),
+                    }
+                }
                 send_and_end(tc, &self.context, reply, read)
             }
             Answer::Rpc(reply) => {
@@ -5264,6 +5850,9 @@ impl InFlight {
     /// it. A write a handler made before it ran out of budget is therefore
     /// still an unproven commit with no barrier of its own.
     fn fail(&mut self, error: anyhow::Error) {
+        if let Some(report) = &mut self.tail_report {
+            report.record_failure(format!("{error:#}"));
+        }
         if let Some(reply) = self.reply.take() {
             if self.trace.is_some_and(|trace| trace.sampled) {
                 self.failure = Some(crate::telemetry::cap_error(error.to_string()));
@@ -5439,6 +6028,12 @@ impl InFlight {
         self.failure.as_deref()
     }
 
+    pub(crate) fn finish_tail_report(&mut self) {
+        if let Some(report) = self.tail_report.take() {
+            report.finish(&self.context);
+        }
+    }
+
     /// How long this handler may still run, or `None` once it has answered.
     ///
     /// The budget bounds the *response*, not the request: `waitUntil` work
@@ -5462,6 +6057,7 @@ impl InFlight {
     pub fn stuck(&mut self) {
         self.fail(anyhow!("handler is waiting on nothing"));
         self.background = None;
+        self.context.seal_wait_until();
     }
 
     /// Whether a nested `WorkerEntrypoint` call is still pending. When no
@@ -5546,6 +6142,7 @@ impl InFlight {
     /// isolate lives. A request that drives itself has to purge them on its
     /// own way out.
     pub fn abandon(&mut self) {
+        self.context.seal_wait_until();
         self.io_context_ops.clear();
         self.unrefed_ops.clear();
         // An op a foreign turn handed this event after its driver's last pass
@@ -5626,6 +6223,7 @@ impl InFlight {
 
     fn retire_background_for_shutdown(&mut self) {
         self.background = None;
+        self.context.seal_wait_until();
         self.context.close_sockets();
     }
 }
@@ -5889,7 +6487,29 @@ pub(crate) fn current_trace_context(
 /// isolate goes through one of these, and none of them may be held across an
 /// await: the caller takes the pool's async permit first, runs a turn, and
 /// leaves.
+/// An isolate's heap as V8 accounts for it, for `/state`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapBytes {
+    /// Physical memory committed to the heap.
+    pub physical: u64,
+    /// External memory the isolate tracks: array buffer stores and the like.
+    pub external: u64,
+}
+
 impl Worker {
+    /// The heap V8 reports for this isolate. Takes the isolate lock, so the
+    /// caller must hold the pool's permit for this worker, exactly as a turn
+    /// does; `None` once the isolate has been freed.
+    pub fn heap_bytes(&self) -> Option<HeapBytes> {
+        let inner = self.inner.as_ref()?;
+        let (mut locker, _cells) = inner.lock();
+        let statistics = locker.get_heap_statistics();
+        Some(HeapBytes {
+            physical: statistics.total_physical_size() as u64,
+            external: statistics.external_memory() as u64,
+        })
+    }
+
     /// Run a request's first turn.
     ///
     /// Returns what is now in flight — `None` when nothing is, the reply
@@ -5914,7 +6534,25 @@ impl Worker {
 
         advance_io_time(tc);
         let previous = install_trace(tc, trace.as_ref());
-        let out = match begin(tc, realm.fetch, job) {
+        let invocation_limits = match &job {
+            crate::WorkerJob::Fetch {
+                invocation_limits, ..
+            }
+            | crate::WorkerJob::Rpc {
+                invocation_limits, ..
+            } => *invocation_limits,
+            crate::WorkerJob::Queue { .. } => None,
+        };
+        let initial_limits =
+            effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
+        let declared_ms = initial_limits.and_then(|limits| limits.cpu_ms);
+        let cpu_watchdog = inner.cpu_watchdog(
+            declared_ms.map(|milliseconds| Duration::from_millis(u64::from(milliseconds))),
+            declared_ms,
+        );
+        let begun = begin(tc, realm.fetch, job);
+        drop(cpu_watchdog);
+        let out = match begun {
             Begun::Running(mut entry) => {
                 entry.trace = trace;
                 // A handler that returned an already-resolved promise is
@@ -5923,8 +6561,20 @@ impl Worker {
                 let ops = finish_turn(tc, &mut entry);
                 (Some(*entry), ops)
             }
-            Begun::Threw(answer) => {
-                answer.fail(anyhow!("fetch threw: {}", exc!(tc)));
+            Begun::Threw(failure) => {
+                let BegunFailure {
+                    answer,
+                    cpu_error,
+                    tail_report,
+                } = *failure;
+                let error = take_execution_termination(tc)
+                    .or_else(|| cpu_error.map(anyhow::Error::msg))
+                    .unwrap_or_else(|| anyhow!("fetch threw: {}", exc!(tc)));
+                if let Some((mut report, context)) = tail_report {
+                    report.record_failure(format!("{error:#}"));
+                    report.finish(&context);
+                }
+                answer.fail(error);
                 (None, Vec::new())
             }
             Begun::Nothing => (None, Vec::new()),
@@ -5966,7 +6616,13 @@ impl Worker {
         advance_io_time(tc);
         let previous_io_context = install_io_context(tc, &entry.context);
         let previous = install_trace(tc, entry.trace.as_ref());
+        entry.context.begin_cpu_turn();
+        let cpu_watchdog = inner.cpu_watchdog(
+            entry.context.remaining_cpu_budget(),
+            entry.context.cpu_limit_ms(),
+        );
         cancel(tc, entry, shutdown);
+        drop(cpu_watchdog);
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
         restore_io_context(tc, previous_io_context);
@@ -6030,8 +6686,14 @@ impl Worker {
         advance_io_time(tc);
         let previous_io_context = install_io_context(tc, &entry.context);
         let previous = install_trace(tc, entry.trace.as_ref());
+        entry.context.begin_cpu_turn();
+        let cpu_watchdog = inner.cpu_watchdog(
+            entry.context.remaining_cpu_budget(),
+            entry.context.cpu_limit_ms(),
+        );
         deliver(tc, entry, op, res);
         cancelled(tc, entry);
+        drop(cpu_watchdog);
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
         restore_io_context(tc, previous_io_context);
@@ -6069,6 +6731,14 @@ impl Worker {
 /// turn, and the spawn and its classification drain together. Such an op
 /// does not defer retirement: see `retired`.
 fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
+    if let Err(error) = finish_cpu_turn(tc, entry) {
+        let error = take_execution_termination_in_context(tc, Some(&entry.context))
+            .unwrap_or_else(|| anyhow!(error));
+        entry.fail_in_turn(error);
+        entry.background = None;
+        entry.abandon();
+        return Vec::new();
+    }
     // `settle` can consume and send the reply before the checkpoint below
     // exposes a final facet write. Hold an embedded facet's reply in the
     // event-owned gate set, so a successful response and its image write are
@@ -6102,8 +6772,20 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     if let Some(scope) = entry.scope.as_deref() {
         storage::flush_embedded(scope);
     }
-    settle(tc, entry);
-    tc.perform_microtask_checkpoint();
+    entry.context.begin_cpu_turn();
+    {
+        let _cpu_watchdog = cpu_watchdog_for_context(tc, &entry.context);
+        settle(tc, entry);
+        tc.perform_microtask_checkpoint();
+    }
+    if let Err(error) = finish_cpu_turn(tc, entry) {
+        let error = take_execution_termination_in_context(tc, Some(&entry.context))
+            .unwrap_or_else(|| anyhow!(error));
+        entry.fail_in_turn(error);
+        entry.background = None;
+        entry.abandon();
+        return Vec::new();
+    }
     if let Some(scope) = entry.scope.as_deref() {
         #[cfg(all(test, celld_internal_tests))]
         if storage::is_embedded(scope)
@@ -6191,10 +6873,16 @@ enum Begun {
     /// The handler threw before it could suspend, so nothing is in flight.
     /// The exception belongs to the caller's `TryCatch` — an unnameable type
     /// no signature here can take — so the caller reads it and answers.
-    Threw(Answer),
+    Threw(Box<BegunFailure>),
     /// Nothing started: the job was not a fetch, or the reply already
     /// carries the error.
     Nothing,
+}
+
+struct BegunFailure {
+    answer: Answer,
+    cpu_error: Option<String>,
+    tail_report: Option<(TailReportState, Arc<IoContext>)>,
 }
 
 /// Start a request: build it, call the Worker's `fetch`, and hand back what
@@ -6211,8 +6899,18 @@ fn begin<'s>(
             entrypoint,
             operation,
             props,
+            invocation_limits,
             reply,
-        } => return begin_entrypoint_rpc(tc, &entrypoint, operation, props, reply),
+        } => {
+            return begin_entrypoint_rpc(
+                tc,
+                &entrypoint,
+                operation,
+                props,
+                invocation_limits,
+                reply,
+            );
+        }
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
@@ -6220,35 +6918,67 @@ fn begin<'s>(
     };
     let crate::WorkerJob::Fetch {
         entrypoint,
+        invocation_limits,
         url,
         method,
         body,
         headers,
         request_id,
+        tail_report,
         reply,
         ..
     } = job
     else {
         return Begun::Nothing;
     };
-    let context = IoContext::new();
+    let runtime_state = actor_runtime_state(tc);
+    let tail_reporting = tail_report.is_some();
+    debug_assert!(
+        !tail_reporting || runtime_state.tail_reporting,
+        "a tail report reached a Worker that was loaded without tails",
+    );
+    // The report sender is the invocation-level authority. The isolate-level
+    // option also applies to RPC and cell events, but those events have no
+    // report to consume retained logs, so enabling capture for them only
+    // holds records until their IoContext retires.
+    let context = IoContext::with_options(
+        effective_resource_limits(runtime_state.resource_limits, invocation_limits),
+        tail_reporting,
+    );
     if let Some(stream_id) = body.stream_id() {
         context.own_body_stream(stream_id);
     }
     let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
     let target = match entrypoint {
         Some(entrypoint) => FetchTarget::Entrypoint(entrypoint),
         None => FetchTarget::Default(fetch),
     };
     let started = start_fetch(tc, target, &url, &method, body, &headers, request_id);
+    let tail_headers = tail_request_headers(&headers);
+    let mut tail_report = tail_report.map(|reply| TailReportState {
+        reply,
+        script_name: runtime_state.script_name.clone(),
+        event_timestamp: unix_now_ms(),
+        url,
+        method,
+        headers: tail_headers,
+        response_status: None,
+        failure: None,
+    });
     let promise = match started {
         Ok(Started::Running(ret, active)) => match ret.try_cast::<v8::Promise>() {
             Ok(promise) => Ok((promise, active)),
             Err(_) => resolved_promise(tc, ret).map(|promise| (promise, active)),
         },
         Ok(Started::Threw) => {
+            let cpu_error = context.finish_cpu_turn().err();
             drop(guard);
-            return Begun::Threw(Answer::Fetch(reply));
+            return Begun::Threw(Box::new(BegunFailure {
+                answer: Answer::Fetch(reply),
+                cpu_error,
+                tail_report: tail_report.take().map(|report| (report, context)),
+            }));
         }
         Err(error) => Err(error),
     };
@@ -6256,7 +6986,7 @@ fn begin<'s>(
         Ok((promise, active_request_id)) => {
             tc.perform_microtask_checkpoint();
             let entry = InFlight {
-                runtime_state: actor_runtime_state(tc),
+                runtime_state,
                 promise: v8::Global::new(tc, promise),
                 context,
                 scope: None,
@@ -6274,11 +7004,20 @@ fn begin<'s>(
                 started: Instant::now(),
                 trace: None,
                 failure: None,
+                tail_report,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
         }
         Err(error) => {
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            if let Some(mut report) = tail_report.take() {
+                report.record_failure(format!("{error:#}"));
+                report.finish(&context);
+            }
             drop(guard);
             let _ = reply.send(Err(error));
             Begun::Nothing
@@ -6297,10 +7036,15 @@ fn begin_entrypoint_rpc(
     entrypoint: &str,
     operation: crate::WorkerRpcOperation,
     props: Vec<u8>,
+    invocation_limits: Option<ResourceLimits>,
     reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 ) -> Begun {
-    let context = IoContext::new();
+    let context = IoContext::with_resource_limits(effective_resource_limits(
+        actor_runtime_state(tc).resource_limits,
+        invocation_limits,
+    ));
     let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
     let started = (|| {
         let f = internal_function(tc, "__dispatchEntrypointRpc")?;
         let entrypoint = v8::String::new(tc, entrypoint).unwrap();
@@ -6354,13 +7098,17 @@ fn begin_entrypoint_rpc(
                 started: event_started,
                 trace: None,
                 failure: None,
+                tail_report: None,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
         }
         Err(error) => {
             let _ = end_event_context(tc);
-            let error = take_execution_termination(tc).unwrap_or(error);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
             drop(guard);
             let _ = reply.send(Err(error));
             Begun::Nothing
@@ -6550,8 +7298,9 @@ fn begin_queue(
     batch: QueueBatch,
     reply: tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>,
 ) -> Begun {
-    let context = IoContext::new();
+    let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
     let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
     let started = (|| {
         let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
         let batch = queue_batch_value(tc, batch)?;
@@ -6588,13 +7337,17 @@ fn begin_queue(
                 started: Instant::now(),
                 trace: None,
                 failure: None,
+                tail_report: None,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
         }
         Err(error) => {
             let _ = end_event_context(tc);
-            let error = take_execution_termination(tc).unwrap_or(error);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
             drop(guard);
             let _ = reply.send(Err(error));
             Begun::Nothing
@@ -6845,6 +7598,7 @@ fn start_cell_event<'s>(
     }
     let guard = CurrentGuard::enter(context.clone());
     let previous_io_context = install_io_context(tc, &context);
+    context.begin_cpu_turn();
     // Sampled before the handler runs so the output gate can tell a write
     // this event made from celld's own activation writes. The first sample of
     // an activation is also the baseline a read-only answer observes above.
@@ -6896,6 +7650,7 @@ fn start_cell_event<'s>(
                 started: event_started,
                 trace: None,
                 failure: None,
+                tail_report: None,
             };
             restore_io_context(tc, previous_io_context);
             drop(guard);
@@ -6905,7 +7660,10 @@ fn start_cell_event<'s>(
             // A V8 termination has a concrete stored cause. The dispatcher
             // wrapper can only report that its call returned no value, so do
             // not replace process.exit or actor-abort with that generic seam.
-            let error = take_execution_termination(tc).unwrap_or(error);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
             // The handler ran synchronously before it threw, and a
             // synchronous storage call both commits and reads, so the error
             // carries the positions it reached like a rejection does.
@@ -6944,6 +7702,7 @@ fn start_cell_event<'s>(
                     started: event_started,
                     trace: None,
                     failure: Some(failure),
+                    tail_report: None,
                 }))
             };
             restore_io_context(tc, previous_io_context);
@@ -7357,6 +8116,7 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
                 // or a disconnect, which `fail` records as not counting.
                 entry.settle_alarm(false, true);
                 let _ = end_event_context(tc);
+                entry.context.seal_wait_until();
                 if let Some(request_id) = entry.active_request_id {
                     finish_incoming_request(tc, request_id);
                 }
@@ -7368,9 +8128,29 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
     if let Some(background) = &entry.background {
         let promise = v8::Local::new(tc, background);
         if !matches!(promise.state(), v8::PromiseState::Pending) {
-            entry.background = None;
+            let late = entry.context.take_late_wait_until();
+            entry.background =
+                wait_until_aggregate(tc, &late).map(|promise| v8::Global::new(tc, promise));
+            if !late.is_empty() && entry.background.is_none() {
+                entry.context.seal_wait_until();
+            }
         }
     }
+}
+
+fn wait_until_aggregate<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    promises: &[v8::Global<v8::Promise>],
+) -> Option<v8::Local<'s, v8::Promise>> {
+    if promises.is_empty() {
+        return None;
+    }
+    let values = promises
+        .iter()
+        .map(|promise| v8::Local::new(scope, promise).into())
+        .collect::<Vec<v8::Local<v8::Value>>>();
+    let array = v8::Array::new_with_elements(scope, &values);
+    all_settled(scope, array.into())?.try_cast().ok()
 }
 
 enum FetchTarget<'s> {
@@ -7501,6 +8281,9 @@ impl Worker {
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress.clone(),
+            resource_limits: config.resource_limits,
+            tail_reporting: config.tail_reporting,
+            script_name: script_name.to_string(),
             ..Default::default()
         });
         let loader_owner = LoaderOwner::fresh(script_name, config.generation);
@@ -7765,6 +8548,7 @@ impl Worker {
                 // to recover from. It panics with the reason named.
                 isolate: unsafe { isolate.try_into_shared() }
                     .unwrap_or_else(|error| panic!("cell isolate cannot be shared: {error}")),
+                runtime_state,
                 realm: Realm { context, fetch },
                 original_heap_limit,
                 compat,
@@ -7911,7 +8695,16 @@ impl Worker {
 
         let event_time = advance_io_time(tc);
         let previous = install_trace(tc, trace.as_ref());
-        let out = match begin_cell(tc, job, event_time) {
+        let cpu_watchdog = inner.cpu_watchdog(
+            inner.initial_cpu_budget(),
+            inner
+                .runtime_state
+                .resource_limits
+                .and_then(|limits| limits.cpu_ms),
+        );
+        let begun = begin_cell(tc, job, event_time);
+        drop(cpu_watchdog);
+        let out = match begun {
             Begun::Running(mut entry) => {
                 entry.trace = trace;
                 let previous_io_context = install_io_context(tc, &entry.context);
@@ -7919,8 +8712,15 @@ impl Worker {
                 restore_io_context(tc, previous_io_context);
                 (Some(*entry), ops)
             }
-            Begun::Threw(answer) => {
-                answer.fail(anyhow!("cell event threw: {}", exc!(tc)));
+            Begun::Threw(failure) => {
+                let BegunFailure {
+                    answer, cpu_error, ..
+                } = *failure;
+                answer.fail(
+                    take_execution_termination(tc)
+                        .or_else(|| cpu_error.map(anyhow::Error::msg))
+                        .unwrap_or_else(|| anyhow!("cell event threw: {}", exc!(tc))),
+                );
                 (None, Vec::new())
             }
             Begun::Nothing => (None, Vec::new()),
@@ -7950,6 +8750,7 @@ impl Worker {
 
         let previous_io_context = install_io_context(tc, &entry.context);
         let previous = install_trace(tc, entry.trace.as_ref());
+        entry.context.begin_cpu_turn();
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
         restore_io_context(tc, previous_io_context);
@@ -7973,6 +8774,11 @@ impl Worker {
 
         let previous_io_context = install_io_context(tc, &entry.context);
         let previous = install_trace(tc, entry.trace.as_ref());
+        entry.context.begin_cpu_turn();
+        let cpu_watchdog = inner.cpu_watchdog(
+            entry.context.remaining_cpu_budget(),
+            entry.context.cpu_limit_ms(),
+        );
         let ids = entry.context.take_pending_events();
         let called = (|| {
             let function = internal_function(tc, "__cancelPendingEvents").ok()?;
@@ -7987,6 +8793,7 @@ impl Worker {
         if called.is_none() {
             entry.fail_in_turn(anyhow!("pending-event cancellation threw"));
         }
+        drop(cpu_watchdog);
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
         restore_io_context(tc, previous_io_context);
@@ -8473,6 +9280,7 @@ ops! { OP_NAMES, install_op_functions,
         "__vfs_read_file" => op_vfs_read_file,
         "__vfs_stat" => op_vfs_stat,
         "__wait_until" => op_wait_until,
+        "__wait_until_active" => op_wait_until_active,
         "__event_depth" => op_event_depth,
         "__als_get" => op_als_get,
         "__als_set" => op_als_set,
@@ -9070,6 +9878,10 @@ fn op_svc_rpc(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    let context = event_context(scope);
+    if let Err(error) = context.charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
     let script = args.get(0).to_rust_string_lossy(scope);
     let entrypoint = args.get(1).to_rust_string_lossy(scope);
     let path = match serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)) {
@@ -9133,6 +9945,9 @@ fn op_svc_call_impl(
     rv: &mut v8::ReturnValue<v8::Value>,
     cancellable: bool,
 ) {
+    if let Err(error) = event_context(scope).charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
     let script = args.get(0).to_rust_string_lossy(scope);
     let url = args.get(1).to_rust_string_lossy(scope);
     let method = args.get(2).to_rust_string_lossy(scope);
@@ -9240,12 +10055,21 @@ fn op_svc_call_impl(
 const MAX_DYNAMIC_WORKER_CODE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_DYNAMIC_WORKER_ENV_SIZE: usize = 1024 * 1024;
 /// The largest `props` value one loaded entrypoint or Durable Object class can
-/// carry, as structured-clone bytes. It matches the `env` ceiling, because
-/// both carry caller-supplied configuration into a loaded Worker.
+/// carry, as structured-clone bytes. Workerd does not impose this bound, but
+/// celld holds the value on a host job for the whole call. The harness shares
+/// the caller's isolate and cannot prevent that unbounded host allocation, so
+/// every op that accepts call props must enforce the limit.
 const MAX_DYNAMIC_WORKER_PROPS_SIZE: usize = 1024 * 1024;
 
 fn loader_props_bytes(value: v8::Local<v8::Value>) -> Result<Vec<u8>, String> {
-    let props = view_bytes(value).unwrap_or_default();
+    // RPC and facet calls use undefined for absent props. A different
+    // non-typed value is a malformed transport argument, not empty props.
+    let props = if value.is_undefined() {
+        Vec::new()
+    } else {
+        view_bytes(value)
+            .ok_or_else(|| "worker loader: the props are not a typed array".to_string())?
+    };
     if props.len() > MAX_DYNAMIC_WORKER_PROPS_SIZE {
         return Err(format!(
             "Dynamic Worker props size ({} bytes) exceeds the maximum \
@@ -9360,6 +10184,15 @@ fn loader_throw(scope: &mut v8::PinScope, message: &str) {
     scope.throw_exception(exception);
 }
 
+fn loader_invocation_limits(
+    scope: &mut v8::PinScope,
+    value: v8::Local<v8::Value>,
+) -> Result<Option<ResourceLimits>, String> {
+    let json = value.to_rust_string_lossy(scope);
+    serde_json::from_str(&json)
+        .map_err(|error| format!("worker loader: invalid invocation limits: {error}"))
+}
+
 async fn loaded_worker_slot(
     mut state: tokio::sync::watch::Receiver<LoaderState>,
 ) -> Result<Arc<crate::pool::Slot>, String> {
@@ -9376,10 +10209,10 @@ async fn loaded_worker_slot(
     }
 }
 
-/// `__loader_load(codeJson, wasm, outbound, outboundProps, envSc, envRoutes)`
-/// -> stub id. Builds a WorkerConfig from the supplied modules and registers
-/// its asynchronous load state. Compilation runs on Tokio's blocking pool.
-/// Calls wait for that result and then use the normal stateless turn driver.
+/// `__loader_load(codeJson, wasm, outbound, outboundProps, envSc, envRoutes,
+/// tailReporting)` -> stub id. Builds a WorkerConfig from the supplied modules
+/// and registers its asynchronous load state. Compilation runs on Tokio's
+/// blocking pool. Calls wait for that result and use the normal turn driver.
 fn op_loader_load(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -9396,14 +10229,22 @@ fn op_loader_load(
     // caller requested, which is more dangerous than refusing the load. Keep
     // this check in the host op so both load() and the lazy get() path cross
     // the same enforcement boundary.
-    for field in ["limits", "tails", "allowExperimental"] {
-        if code.get(field).is_some() {
-            return loader_throw(
-                scope,
-                &format!("worker loader: WorkerCode field `{field}` is not supported"),
-            );
-        }
+    if code.get("allowExperimental").is_some() {
+        return loader_throw(
+            scope,
+            "worker loader: WorkerCode field `allowExperimental` is not supported",
+        );
     }
+    let limits = match code.get("limits") {
+        Some(value) => match serde_json::from_value::<ResourceLimits>(value.clone()) {
+            Ok(limits) => Some(limits),
+            Err(error) => {
+                return loader_throw(scope, &format!("worker loader: invalid limits: {error}"));
+            }
+        },
+        None => None,
+    };
+    let tail_reporting = args.get(6).boolean_value(scope);
     let Some(main) = code.get("mainModule").and_then(|v| v.as_str()) else {
         return loader_throw(scope, "worker loader: missing mainModule");
     };
@@ -9641,6 +10482,8 @@ fn op_loader_load(
         .into_dynamic_worker()
         .with_generation(generation)
         .with_egress(egress)
+        .with_resource_limits(limits)
+        .with_tail_reporting(tail_reporting)
         .with_loader_env(loader_env),
     );
     handle.spawn(async move {
@@ -9657,9 +10500,10 @@ fn op_loader_load(
 }
 
 /// `__loader_fetch(id, url, method, body, headersJson, streamId, entrypoint,
-/// propsSc)`
-/// -> Promise<json>. The loaded-worker analog of `__svc_call`: encodes the
-/// response the same way.
+/// propsSc, limitsJson, tailReporting)` -> Promise<json> or
+/// [Promise<json>, Promise<json>].
+/// The loaded-worker analog of `__svc_call`: it encodes the response the same
+/// way and can return a separate report after the invocation finishes.
 fn op_loader_fetch(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -9673,9 +10517,13 @@ fn op_loader_fetch(
         return loader_throw(scope, "worker loader: the entrypoint is not a string");
     }
     let entrypoint = entrypoint.to_rust_string_lossy(scope);
-    let props = match view_bytes(args.get(7)) {
-        Some(props) => props,
-        None => return loader_throw(scope, "worker loader: the props are not a typed array"),
+    let props = match loader_props_bytes(args.get(7)) {
+        Ok(props) => props,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let invocation_limits = match loader_invocation_limits(scope, args.get(8)) {
+        Ok(limits) => limits,
+        Err(error) => return loader_throw(scope, &error),
     };
     // The Worker already stores its default handler, including the synthetic
     // missing-handler function for a class-only module. A named entrypoint
@@ -9711,6 +10559,13 @@ fn op_loader_fetch(
                 )
             }
         };
+    let want_tail_report = args.get(9).boolean_value(scope);
+    let (tail_report, tail_receive) = if want_tail_report {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        (Some(send), Some(receive))
+    } else {
+        (None, None)
+    };
     let mut body_guard = match body.stream_id() {
         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
             Some(guard) => guard,
@@ -9737,6 +10592,7 @@ fn op_loader_fetch(
         let job = crate::WorkerJob::Fetch {
             queued_at: Instant::now(),
             entrypoint,
+            invocation_limits,
             url,
             method,
             body,
@@ -9745,6 +10601,7 @@ fn op_loader_fetch(
             // target does. The id selects the stream-aware construction path
             // and gives an abandoned request a lifecycle owner.
             request_id: Some(next_request_id()),
+            tail_report,
             reply,
         };
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
@@ -9763,7 +10620,19 @@ fn op_loader_fetch(
             },
         }
     });
-    rv.set(promise_for(scope, async_id));
+    let response = promise_for(scope, async_id);
+    let Some(tail_receive) = tail_receive else {
+        rv.set(response);
+        return;
+    };
+    let report_id = asyncrt::enqueue(async move {
+        tail_receive
+            .await
+            .map_err(|error| format!("loaded worker dropped tail report: {error}"))
+    });
+    let report = promise_for(scope, report_id);
+    let pair = v8::Array::new_with_elements(scope, &[response, report]);
+    rv.set(pair.into());
 }
 
 /// Reclaims a streamed request body if a host dispatch fails before the
@@ -9806,7 +10675,7 @@ impl Drop for RequestBodyGuard {
     }
 }
 
-/// `__loader_rpc(id, entrypoint, method, argsSc, propsSc)` ->
+/// `__loader_rpc(id, entrypoint, method, argsSc, propsSc, limitsJson)` ->
 /// Promise<Uint8Array>. The loaded-worker analog of `__svc_rpc`: a
 /// named-entrypoint method call whose args and result are V8 structured-clone
 /// bytes. `propsSc` carries `getEntrypoint(name, {props})` to the callee's
@@ -9822,6 +10691,10 @@ fn op_loader_rpc(
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
     let props = match loader_props_bytes(args.get(4)) {
         Ok(props) => props,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let invocation_limits = match loader_invocation_limits(scope, args.get(5)) {
+        Ok(limits) => limits,
         Err(error) => return loader_throw(scope, &error),
     };
     // The props ride on `WorkerJob::Rpc` for the whole call, so an unbounded
@@ -9847,6 +10720,7 @@ fn op_loader_rpc(
                 args: call_args,
             },
             props,
+            invocation_limits,
             reply,
         };
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
@@ -10463,6 +11337,10 @@ fn op_fetch(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    let context = event_context(scope);
+    if let Err(error) = context.charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
     let egress = actor_runtime_state(scope).egress.clone();
     // A loaded worker with globalOutbound: null has no ambient egress: it must
     // reach the world through `env` capabilities. Message matches workerd.
@@ -10523,12 +11401,10 @@ fn op_fetch(
     // Request validates this value in the harness, but the native op is a
     // separate trust boundary. Keep this match exhaustive so a future direct
     // caller cannot turn an unknown mode into redirect-following behavior.
-    let client_key = match redirect.as_str() {
-        "follow" => &HTTP,
-        "manual" => &HTTP_MANUAL,
-        "error" => &HTTP_ERROR,
+    match redirect.as_str() {
+        "follow" | "manual" | "error" => {}
         other => return loader_throw(scope, &format!("fetch: unknown redirect mode {other}")),
-    };
+    }
     if let EgressPolicy::Broker(broker) = egress {
         let (request_id, cancel, cancel_guard) = if cancellable {
             let request_id = next_do_request_id();
@@ -10582,7 +11458,13 @@ fn op_fetch(
     }
     // Select the client only for direct egress: a broker must not initialize
     // an unused network client and its TLS stack.
-    let client = client_key.with(|client| client.clone());
+    let client = match redirect.as_str() {
+        "follow" if context.subrequest_limit.is_some() => context.redirect_counting_client(),
+        "follow" => HTTP.with(|client| client.clone()),
+        "manual" => HTTP_MANUAL.with(|client| client.clone()),
+        "error" => HTTP_ERROR.with(|client| client.clone()),
+        _ => unreachable!("the redirect mode was validated above"),
+    };
     // The creating context, read here while JS is still running: the op
     // future resolves on whatever worker polls it, far from any CPED.
     let trace = current_trace_context(scope);
@@ -10748,8 +11630,9 @@ fn op_fetch(
                 .to_string())
             }
             Err(e) => {
-                finish(false, None, Some(format!("fetch: {e}")));
-                Err(format!("fetch: {e}"))
+                let error = fetch_request_error(&e);
+                finish(false, None, Some(error.clone()));
+                Err(error)
             }
         }
     });
@@ -12018,10 +12901,27 @@ fn op_log(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let msg: Vec<String> = (0..args.length())
+    let mut msg: Vec<String> = (0..args.length())
         .map(|i| args.get(i).to_rust_string_lossy(scope))
         .collect();
+    let level = if msg.len() >= 2
+        && matches!(
+            msg.first().map(String::as_str),
+            Some("debug" | "error" | "info" | "log" | "warn")
+        ) {
+        msg.remove(0)
+    } else {
+        "log".to_string()
+    };
     let body = msg.join(" ");
+    if let Some(context) = current_reaction_or_untracked_io_context(scope) {
+        context.record_tail_log(&level, &body);
+    }
+    let displayed = match level.as_str() {
+        "error" => format!("ERROR {body}"),
+        "warn" => format!("WARN {body}"),
+        _ => body,
+    };
     // Correlated by CPED, so a continuation logging after an await — or
     // another entry's continuation running in this turn's checkpoint —
     // lands on the trace that owns it, not on whoever holds the isolate.
@@ -12033,11 +12933,11 @@ fn op_log(
                 trace_id: Some(ids.trace_id),
                 span_id: Some(ids.span_id),
                 time_unix_us: crate::telemetry::now_unix_us(),
-                body: body.clone(),
+                body: displayed.clone(),
             });
         }
     }
-    tracing::info!(target: "cell_console", "{}", body);
+    tracing::info!(target: "cell_console", "{}", displayed);
 }
 fn op_heap_limit_excessively_exceeded(
     scope: &mut v8::PinScope,
@@ -12373,7 +13273,10 @@ fn op_test_queue_rearm_bounded(
         QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(true));
     }
 }
-mod r2_ops;
+// `celld r2` writes an object a binding then reads, so the operator command
+// calls the very functions the ops call rather than a second implementation
+// of the object record.
+pub(crate) mod r2_ops;
 mod storage_ops;
 use storage_ops::{actor_runtime_state, throw_storage_error};
 
@@ -12616,6 +13519,15 @@ struct IoEventFrame {
 #[derive(Default)]
 struct IoEventState {
     frames: Vec<IoEventFrame>,
+    /// Registrations made by active `waitUntil` work after the handler's
+    /// frame ended. The driver folds each batch into a new aggregate before
+    /// it retires the event, so one callback can extend the same lifetime.
+    late_wait_until: Vec<v8::Global<v8::Promise>>,
+    /// True from the top-level frame's first non-empty drain until the driver
+    /// observes that drain settled with no later registrations. Keeping this
+    /// state on the request prevents a foreign event in the same isolate from
+    /// lending or taking away registration authority.
+    wait_until_active: bool,
     ended_arm_gates: Vec<ArmGateRx>,
     arm_gates_sealed: bool,
 }
@@ -12947,6 +13859,21 @@ pub struct IoContext {
     /// driver consumes these IDs only when the request has no native work, so
     /// it can reject the calls instead of timing out the enclosing event.
     pending_events: Mutex<HashSet<u64>>,
+    /// The invocation-local subrequest budget. The count lives with the
+    /// request context, so two concurrent calls into one loaded isolate never
+    /// spend one another's allowance.
+    subrequest_limit: Option<u32>,
+    subrequests: AtomicUsize,
+    /// A request-scoped client counts redirects against this request. A weak
+    /// capture avoids a client/context cycle, and one client retains the
+    /// connection pool across all fetches in the invocation.
+    redirect_client: OnceLock<reqwest::Client>,
+    cpu_limit_nanos: Option<u64>,
+    cpu_used_nanos: AtomicU64,
+    cpu_turn: Mutex<Option<CpuTurnStart>>,
+    /// Whether this event records console calls for a Dynamic Worker tail.
+    tail_reporting: bool,
+    tail_logs: Mutex<TailLogCapture>,
 }
 
 /// An op enqueued by one event's continuation during another event's turn: the
@@ -12954,15 +13881,150 @@ pub struct IoContext {
 type HandedOp = (u64, asyncrt::OpFuture, asyncrt::OpLifetime);
 
 impl IoContext {
+    fn record_tail_log(&self, level: &str, body: &str) {
+        if !self.tail_reporting {
+            return;
+        }
+        let mut capture = self.tail_logs.lock().unwrap();
+        if capture.full {
+            return;
+        }
+        let separator = usize::from(!capture.records.is_empty());
+        // A serialized string cannot be shorter than its UTF-8 input. This
+        // rejects an obviously oversized call without allocating another
+        // buffer or scanning it for JSON escapes.
+        let minimum_bytes = capture
+            .serialized_bytes
+            .saturating_add(separator)
+            .saturating_add(body.len())
+            .saturating_add(2);
+        if minimum_bytes > TAIL_LOG_LIMIT_BYTES {
+            capture.full = true;
+            return;
+        }
+        let record = TailLog {
+            timestamp: crate::telemetry::now_unix_us() / 1_000,
+            level: level.to_string(),
+            message: vec![body.to_string()],
+        };
+        let record_bytes = serialized_json_bytes(&record);
+        let next_bytes = capture
+            .serialized_bytes
+            .saturating_add(separator)
+            .saturating_add(record_bytes);
+        if next_bytes.saturating_add(2) > TAIL_LOG_LIMIT_BYTES {
+            capture.full = true;
+            return;
+        }
+        capture.serialized_bytes = next_bytes;
+        capture.records.push(record);
+    }
+
+    fn take_tail_logs(&self) -> Vec<TailLog> {
+        std::mem::take(&mut *self.tail_logs.lock().unwrap()).records
+    }
+
     /// The continuation id this context is registered under, which names
     /// the event to the cell's gate. `None` for a context V8 never captures.
     fn continuation_id(&self) -> Option<u64> {
         self.continuation.as_ref().map(|(id, _)| *id)
     }
 
+    fn cpu_limit_ms(&self) -> Option<u32> {
+        self.cpu_limit_nanos
+            .and_then(|limit| u32::try_from(limit / 1_000_000).ok())
+    }
+
+    fn redirect_counting_client(self: &Arc<Self>) -> reqwest::Client {
+        self.redirect_client
+            .get_or_init(|| {
+                let context = Arc::downgrade(self);
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                        if attempt.previous().len() >= 10 {
+                            return attempt.error("too many redirects");
+                        }
+                        if let Some(context) = context.upgrade() {
+                            if let Err(error) = context.charge_subrequest() {
+                                return attempt.error(RedirectSubrequestLimit(error));
+                            }
+                        }
+                        attempt.follow()
+                    }))
+                    .build()
+                    .expect("build the redirect-counting HTTP client")
+            })
+            .clone()
+    }
+
+    /// Spend one subrequest from this invocation before the operation leaves
+    /// the isolate. The failed attempt is counted too, so repeated catches
+    /// cannot retry an operation that already exhausted the budget.
+    fn charge_subrequest(&self) -> Result<(), String> {
+        let Some(limit) = self.subrequest_limit else {
+            return Ok(());
+        };
+        let used = self.subrequests.fetch_add(1, Ordering::Relaxed) + 1;
+        if used > limit as usize {
+            return Err(format!("Worker exceeded subrequest limit of {limit}"));
+        }
+        Ok(())
+    }
+
+    fn begin_cpu_turn(&self) {
+        if self.cpu_limit_nanos.is_none() {
+            return;
+        }
+        *self.cpu_turn.lock().unwrap() = Some(CpuTurnStart {
+            thread_nanos: thread_cpu_nanos(),
+            wall: Instant::now(),
+        });
+    }
+
+    fn remaining_cpu_budget(&self) -> Option<Duration> {
+        self.cpu_limit_nanos.map(|limit| {
+            Duration::from_nanos(limit.saturating_sub(self.cpu_used_nanos.load(Ordering::Relaxed)))
+        })
+    }
+
+    fn finish_cpu_turn(&self) -> Result<(), String> {
+        let Some(limit) = self.cpu_limit_nanos else {
+            return Ok(());
+        };
+        let Some(started) = self.cpu_turn.lock().unwrap().take() else {
+            return Ok(());
+        };
+        let elapsed = started
+            .thread_nanos
+            .zip(thread_cpu_nanos())
+            .map(|(started, finished)| finished.saturating_sub(started))
+            .unwrap_or_else(|| started.wall.elapsed().as_nanos() as u64);
+        let used = self.cpu_used_nanos.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
+        if used > limit {
+            return Err(format!(
+                "Worker exceeded CPU limit of {} ms",
+                limit / 1_000_000
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::new_ret_no_self, clippy::new_without_default)]
     #[doc(hidden)]
     pub fn new() -> Arc<Self> {
+        Self::with_resource_limits(None)
+    }
+
+    fn with_resource_limits(limits: Option<ResourceLimits>) -> Arc<Self> {
+        Self::with_options(limits, false)
+    }
+
+    #[cfg(all(test, celld_internal_tests))]
+    fn with_tail_reporting(tail_reporting: bool) -> Arc<Self> {
+        Self::with_options(None, tail_reporting)
+    }
+
+    fn with_options(limits: Option<ResourceLimits>, tail_reporting: bool) -> Arc<Self> {
         Arc::new(Self {
             continuation: None,
             call_chains: Mutex::new(CallChains::default()),
@@ -12980,6 +14042,16 @@ impl IoContext {
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
             pending_events: Mutex::new(HashSet::new()),
+            subrequest_limit: limits.and_then(|limits| limits.sub_requests),
+            subrequests: AtomicUsize::new(0),
+            redirect_client: OnceLock::new(),
+            cpu_limit_nanos: limits
+                .and_then(|limits| limits.cpu_ms)
+                .map(|milliseconds| u64::from(milliseconds).saturating_mul(1_000_000)),
+            cpu_used_nanos: AtomicU64::new(0),
+            cpu_turn: Mutex::new(None),
+            tail_reporting,
+            tail_logs: Mutex::new(TailLogCapture::default()),
         })
     }
 
@@ -13002,6 +14074,22 @@ impl IoContext {
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
             pending_events: Mutex::new(HashSet::new()),
+            subrequest_limit: runtime_state
+                .resource_limits
+                .and_then(|limits| limits.sub_requests),
+            subrequests: AtomicUsize::new(0),
+            redirect_client: OnceLock::new(),
+            cpu_limit_nanos: runtime_state
+                .resource_limits
+                .and_then(|limits| limits.cpu_ms)
+                .map(|milliseconds| u64::from(milliseconds).saturating_mul(1_000_000)),
+            cpu_used_nanos: AtomicU64::new(0),
+            cpu_turn: Mutex::new(None),
+            // Tracked contexts drive cell and RPC events. Dynamic Worker tail
+            // reports currently belong only to fetch jobs, whose untracked
+            // context is constructed from the report sender in `begin`.
+            tail_reporting: false,
+            tail_logs: Mutex::new(TailLogCapture::default()),
         });
         runtime_state
             .io_contexts
@@ -13145,13 +14233,43 @@ impl IoContext {
         } else {
             events.ended_arm_gates.append(&mut frame.arm_gates);
         }
+        if events.frames.is_empty() && !frame.wait_until.is_empty() {
+            events.wait_until_active = true;
+        }
         Some(frame.wait_until)
     }
 
     fn register_wait_until(&self, promise: v8::Global<v8::Promise>) {
-        if let Some(frame) = self.events.lock().unwrap().frames.last_mut() {
+        let mut events = self.events.lock().unwrap();
+        if let Some(frame) = events.frames.last_mut() {
             frame.wait_until.push(promise);
+        } else if events.wait_until_active {
+            events.late_wait_until.push(promise);
         }
+    }
+
+    /// Whether imported `waitUntil()` has request-associated work to extend.
+    fn accepts_wait_until(&self) -> bool {
+        let events = self.events.lock().unwrap();
+        !events.frames.is_empty() || events.wait_until_active
+    }
+
+    /// Take registrations made while the current background aggregate ran.
+    /// An empty batch seals the registration window together with the
+    /// driver's decision to retire that aggregate.
+    fn take_late_wait_until(&self) -> Vec<v8::Global<v8::Promise>> {
+        let mut events = self.events.lock().unwrap();
+        let late = std::mem::take(&mut events.late_wait_until);
+        if late.is_empty() {
+            events.wait_until_active = false;
+        }
+        late
+    }
+
+    fn seal_wait_until(&self) {
+        let mut events = self.events.lock().unwrap();
+        events.wait_until_active = false;
+        events.late_wait_until.clear();
     }
 
     fn register_arm_gate(&self, gate: ArmGateRx) -> Result<(), ArmGateRx> {
@@ -13496,22 +14614,16 @@ fn op_event_end<'s>(
         rv.set_null();
         return;
     };
-    if frame.is_empty() {
-        rv.set_null();
-        return;
-    }
-    let promises: Vec<v8::Local<v8::Value>> = frame
-        .iter()
-        .map(|promise| v8::Local::new(scope, promise).into())
-        .collect();
-    let array = v8::Array::new_with_elements(scope, &promises);
-    match all_settled(scope, array.into()) {
-        Some(aggregate) => rv.set(aggregate),
+    match wait_until_aggregate(scope, &frame) {
+        Some(aggregate) => rv.set(aggregate.into()),
         None => rv.set_null(),
     }
 }
 
-fn pending_event_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
+/// Resolve the request whose code is running, even when its reaction executes
+/// during another request's microtask checkpoint. A missing captured context
+/// is retired, so it must not fall back to the request driving this turn.
+fn reaction_or_current_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
     match reaction_continuation_id(scope) {
         Some(id) => actor_runtime_state(scope).io_context(id),
         None => Some(current_context()),
@@ -13526,7 +14638,7 @@ fn op_pending_event_begin(
     let Some(id) = args.get(0).integer_value(scope) else {
         return;
     };
-    if let Some(context) = pending_event_context(scope) {
+    if let Some(context) = reaction_or_current_context(scope) {
         context.register_pending_event(id as u64);
     }
 }
@@ -13539,7 +14651,7 @@ fn op_pending_event_end(
     let Some(id) = args.get(0).integer_value(scope) else {
         return;
     };
-    if let Some(context) = pending_event_context(scope) {
+    if let Some(context) = reaction_or_current_context(scope) {
         context.finish_pending_event(id as u64);
     }
 }
@@ -13658,12 +14770,22 @@ fn op_wait_until<'s>(
             Err(_) => return,
         },
     };
-    current_context().register_wait_until(v8::Global::new(scope, promise));
+    if let Some(context) = reaction_or_current_context(scope) {
+        context.register_wait_until(v8::Global::new(scope, promise));
+    }
 }
 
-/// How many events are open on the current request. The harness uses it for
-/// workerd's global-scope error, which fires when `waitUntil` is imported and
-/// called with no event in progress.
+fn op_wait_until_active(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let active =
+        reaction_or_current_context(scope).is_some_and(|context| context.accepts_wait_until());
+    rv.set(v8::Boolean::new(scope, active).into());
+}
+
+/// How many event frames are open on the current request.
 fn op_event_depth(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,

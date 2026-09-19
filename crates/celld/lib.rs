@@ -308,7 +308,7 @@ mod conformance_facet_failure_tests {
 pub mod assets;
 #[cfg(not(celld_internal_tests))]
 pub mod asyncrt;
-// The corpus flag alone selects the simulated asyncrt, so an external
+// The internal test flag alone selects the simulated asyncrt, so an external
 // test harness built with the flag sees the same simulated world the
 // in-crate suites see. `test` must not be part of the gate:
 // a dependency never has it, and the harness binary builds unflagged,
@@ -361,6 +361,7 @@ pub mod pool;
 pub mod protocol;
 pub(crate) mod queue_batching;
 pub mod queue_cli;
+pub mod r2_cli;
 pub mod replication;
 pub mod runtime;
 pub mod startup;
@@ -484,6 +485,15 @@ pub struct WorkerFetchEntrypoint {
     pub props: Vec<u8>,
 }
 
+/// Resource limits selected by a Worker Loader stub for one invocation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerInvocationLimits {
+    pub cpu_ms: Option<u32>,
+    pub sub_requests: Option<u32>,
+}
+
 /// One operation on a Worker entrypoint. A property read has no arguments,
 /// while a call owns its complete receiver path and structured-clone payload.
 pub enum WorkerRpcOperation {
@@ -497,11 +507,15 @@ pub enum WorkerJob {
         /// An entrypoint dispatcher target, or the direct default export when
         /// absent.
         entrypoint: Option<WorkerFetchEntrypoint>,
+        invocation_limits: Option<WorkerInvocationLimits>,
         url: String,
         method: String,
         body: js::RequestBody,
         headers: Vec<(String, String)>,
         request_id: Option<js::RequestId>,
+        /// Receives one completed invocation report for Dynamic Worker tails.
+        /// Ordinary fetches leave this empty.
+        tail_report: Option<tokio::sync::oneshot::Sender<String>>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::HttpResponse>>,
     },
     Rpc {
@@ -512,6 +526,7 @@ pub enum WorkerJob {
         /// encoded value can be. A Worker Loader entrypoint or a transferred
         /// Service Binding can set it.
         props: Vec<u8>,
+        invocation_limits: Option<WorkerInvocationLimits>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
     Queue {

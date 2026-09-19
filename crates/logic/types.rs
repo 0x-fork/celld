@@ -826,16 +826,29 @@ pub enum Event {
     RuntimeStopped {
         op: OpId,
     },
-    /// A bounded stop did not complete before its deadline. The runtime is
+    /// A stop returned an error after its retry deadline. The runtime is
     /// gone, the database stays open, and the cell restarts on it at the
-    /// same epoch, as a generation swap does.
+    /// same epoch, as a generation swap does. A pending stop emits no result.
     RuntimeStopFailed {
         op: OpId,
     },
-    /// Policy input for this first slice. Later eviction selection emits this
-    /// from the same core rather than an external caller choosing a victim.
+    /// The host rescued the database for new activity instead of completing
+    /// the eviction. The runtime restarts through the failed-stop path.
+    RuntimeStopCancelled {
+        op: OpId,
+    },
+    /// Attempt a policy eviction without a caller result. Deterministic
+    /// policy drivers use this input; the Actor uses `EvictRequested` so a
+    /// refusal or an interrupted operation cannot look like success.
     Evict {
         cell: CellId,
+    },
+    /// Try an explicit eviction now and report admission before its effects
+    /// run, so the executor can bind the caller to the accepted operation.
+    EvictRequested {
+        request: RequestId,
+        cell: CellId,
+        now_mono_ms: u64,
     },
     /// A periodic resource sample from the edge.
     ///
@@ -886,10 +899,6 @@ pub enum Route {
 pub struct WorkerRoute {
     pub cell: CellId,
     pub epoch: Epoch,
-    /// A pending durability proof made stale by selecting this still-routable
-    /// resident. The executor uses the ID only to release its effect waiter;
-    /// a late completion is ignored by the core's phase check.
-    pub retired_durability: Option<OpId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -908,10 +917,113 @@ pub enum RequestError {
     DurabilityUnproven,
 }
 
+/// A successful local eviction request. A later request can reactivate the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictSuccess {
+    /// The awaited eviction completes its runtime stop, including for joined callers.
+    Evicted,
+    /// The Actor finds settled local absence without a pending lifecycle transition.
+    AlreadyAbsent,
+}
+
+/// An eviction refused before an operation starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictRefusal {
+    NodeUnavailable,
+    CellActive,
+    CellTransitioning,
+    AlarmImminent,
+    AlarmUncovered,
+    ConcurrencyLimit,
+}
+
+/// An accepted eviction interrupted by a later lifecycle decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictCancellation {
+    Activity,
+    Alarm,
+    NodeFenced,
+}
+
+/// An eviction whose completion could not be established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictFailure {
+    Durability,
+    DurabilityTimeout,
+    RuntimeStop,
+    ActorUnavailable,
+    ReplyLost,
+}
+
+/// Refusal and cancellation are expected outcomes, not node malfunctions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictError {
+    Refused(EvictRefusal),
+    Cancelled(EvictCancellation),
+    Failed(EvictFailure),
+}
+
+impl EvictError {
+    /// Stable category shared by Rust diagnostics and HTTP responses.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Cancelled(_) => "cancelled",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// Stable reason code. Debug output cannot define the wire contract,
+    /// because a Rust variant rename must not change operator clients.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused(EvictRefusal::NodeUnavailable) => "node_unavailable",
+            Self::Refused(EvictRefusal::CellActive) => "cell_active",
+            Self::Refused(EvictRefusal::CellTransitioning) => "cell_transitioning",
+            Self::Refused(EvictRefusal::AlarmImminent) => "alarm_imminent",
+            Self::Refused(EvictRefusal::AlarmUncovered) => "alarm_uncovered",
+            Self::Refused(EvictRefusal::ConcurrencyLimit) => "eviction_limit",
+            Self::Cancelled(EvictCancellation::Activity) => "new_activity",
+            Self::Cancelled(EvictCancellation::Alarm) => "alarm_activity",
+            Self::Cancelled(EvictCancellation::NodeFenced) => "node_fenced",
+            Self::Failed(EvictFailure::Durability) => "durability_failed",
+            Self::Failed(EvictFailure::DurabilityTimeout) => "durability_timeout",
+            Self::Failed(EvictFailure::RuntimeStop) => "runtime_stop_failed",
+            Self::Failed(EvictFailure::ActorUnavailable) => "actor_unavailable",
+            Self::Failed(EvictFailure::ReplyLost) => "reply_lost",
+        }
+    }
+}
+
+impl std::fmt::Display for EvictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind(), self.reason())
+    }
+}
+
+impl std::error::Error for EvictError {}
+
+/// Admission of an explicit caller. The core keeps its operation binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionAdmission {
+    Absent,
+    Pending,
+}
+
 /// Work performed outside the core. Every asynchronous effect is versioned;
 /// completion events with an obsolete `op` are ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    EvictionAdmission {
+        request: RequestId,
+        result: Result<EvictionAdmission, EvictError>,
+    },
+    /// Settle a caller bound to the completed operation. A later activation
+    /// or eviction of the same cell cannot change this result.
+    EvictionFinished {
+        request: RequestId,
+        result: Result<EvictSuccess, EvictError>,
+    },
     ScheduleTimer {
         timer: Timer,
         at_mono_ms: u64,
@@ -1076,10 +1188,10 @@ pub enum Effect {
         cell: CellId,
         epoch: Epoch,
         cause: StopCause,
-        /// The shell gives up after its operation deadline and reports
-        /// `RuntimeStopFailed`. A drain and a fence retry until the process
-        /// ends, because their node is leaving; an eviction on a serving
-        /// node is not worth a cell that never answers again.
+        /// After a returned error, the shell stops retrying at its deadline
+        /// and reports `RuntimeStopFailed`. An in-flight release has no
+        /// timeout. A drain and a fence keep retrying returned errors until
+        /// the process ends, because their node is leaving.
         bounded: bool,
     },
     /// Give the cell back instead of finishing this eviction stop.
@@ -1087,7 +1199,7 @@ pub enum Effect {
     /// A request is waiting on a cell in `Phase::Cleaning`, and the stop that
     /// holds it is a bounded eviction, so the node has somewhere to put the
     /// cell back. The shell abandons the stop if it can still do so, and it
-    /// reports `RuntimeStopFailed`, which restarts the cell on its open
+    /// reports `RuntimeStopCancelled`, which restarts the cell on its open
     /// database at the epoch it already had.
     ///
     /// The shell decides whether it is still able to. An eviction that has

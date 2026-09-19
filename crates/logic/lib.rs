@@ -708,6 +708,10 @@ pub struct State {
     /// permits: the bound belongs in the replayable state machine rather than
     /// being implied by how many executor tasks happen to exist.
     eviction_permits: BTreeSet<CellId>,
+    /// Bind explicit callers to their operation in the same place that moves
+    /// a proof to its stop. The executor must not reconstruct that binding
+    /// from unrelated effects in the same batch. Policy evictions have none.
+    eviction_notifications: BTreeMap<OpId, BTreeSet<RequestId>>,
     /// Cells waiting for a residency slot, in arrival order. FIFO is the
     /// whole admission policy: waking every waiter on a release and letting
     /// them race is unfair by construction — under sustained eviction a
@@ -858,6 +862,7 @@ impl State {
             activation_waiters: VecDeque::new(),
             activation_permits: BTreeSet::new(),
             eviction_permits: BTreeSet::new(),
+            eviction_notifications: BTreeMap::new(),
             capacity_waiters: VecDeque::new(),
             capacity_requests: BTreeSet::new(),
             handoff_requests: BTreeSet::new(),
@@ -1060,7 +1065,7 @@ impl State {
         self.quiescing_cells.len()
     }
 
-    /// Return the release pump's exact cell-table work for a private bounded
+    /// Return the release pump's exact cell-table work for a bounded
     /// work assertion. This is not elapsed time, so the result is stable on
     /// every host and under every scheduler.
     #[cfg(celld_internal_tests)]
@@ -1187,7 +1192,7 @@ impl State {
     /// `occupied` cannot say: it counts residency, so a node holding thousands
     /// of cells part-way through a cold start reports almost none. A fleet held
     /// that state for fifteen minutes and the record could not say what the
-    /// cells were doing (issue #50).
+    /// cells were doing.
     ///
     /// The names are part of the operator interface. A chart and a human read
     /// them, so they do not change with an internal rename.
@@ -1289,6 +1294,18 @@ impl State {
             ));
         }
         let eviction_ceiling = self.eviction_ceiling();
+        for op in self.eviction_notifications.keys() {
+            let waiting = self.cell_ops.get(op).and_then(|id| self.cells.get(id));
+            if !waiting.is_some_and(|cell| {
+                matches!(cell.phase,
+                    Phase::EnsuringDurability { op: current, .. }
+                    | Phase::Cleaning { op: current, cause: StopCause::Evict { .. }, .. }
+                    if current == *op
+                )
+            }) {
+                return Err(format!("eviction notification {op} has no live operation"));
+            }
+        }
         if self.eviction_permits.len() > eviction_ceiling {
             return Err(format!(
                 "evicting {} exceeds ceiling {}",
@@ -1553,8 +1570,11 @@ impl State {
             let Some(cell) = self.cells.get(id) else {
                 return Err(format!("cell op {op} points to missing cell {id:?}"));
             };
-            if cell.phase == Phase::Fenced && cell.releasing != Some(*op) {
-                return Err(format!("fenced cell {id:?} retains stale operation {op}"));
+            if phase_op(&cell.phase) != Some(*op)
+                && cell.releasing != Some(*op)
+                && !matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == *op)
+            {
+                return Err(format!("indexed cell op {op} has no owning slot in {id:?}"));
             }
         }
         for op in &self.timed_out_runtime_starts {
@@ -1834,9 +1854,17 @@ impl State {
     /// Return a voluntary eviction to service as one transition. Every
     /// rescue returns the permit with the phase, or the cell looks resident
     /// while a permit stays spent.
-    fn cancel_eviction(&mut self, id: &str, cell: &mut Cell, epoch: Epoch) {
+    fn cancel_eviction(
+        &mut self,
+        id: &str,
+        cell: &mut Cell,
+        epoch: Epoch,
+        reason: EvictCancellation,
+        effects: &mut Vec<Effect>,
+    ) {
         if let Some(op) = phase_op(&cell.phase) {
             self.cell_ops.remove(&op);
+            self.finish_eviction(op, Err(EvictError::Cancelled(reason)), effects);
         }
         set_phase(&mut self.occupied, cell, Phase::Resident { epoch });
         self.eviction_permits.remove(id);
@@ -1847,9 +1875,8 @@ impl State {
             .cells
             .iter()
             .filter_map(|(id, cell)| {
-                let (epoch, retired_durability) = match cell.phase {
-                    Phase::Resident { epoch } => (epoch, None),
-                    Phase::EnsuringDurability { op, epoch } => (epoch, Some(op)),
+                let epoch = match cell.phase {
+                    Phase::Resident { epoch } | Phase::EnsuringDurability { epoch, .. } => epoch,
                     _ => return None,
                 };
                 if cell.quiescing
@@ -1858,34 +1885,37 @@ impl State {
                 {
                     return None;
                 }
-                Some((id.clone(), epoch, retired_durability))
+                Some((id.clone(), epoch))
             })
-            .find(|(id, _, _)| self.worker_cursor.as_ref().is_none_or(|cursor| id > cursor))
+            .find(|(id, _)| self.worker_cursor.as_ref().is_none_or(|cursor| id > cursor))
             .or_else(|| {
                 self.cells.iter().find_map(|(id, cell)| {
-                    let (epoch, retired_durability) = match cell.phase {
-                        Phase::Resident { epoch } => (epoch, None),
-                        Phase::EnsuringDurability { op, epoch } => (epoch, Some(op)),
+                    let epoch = match cell.phase {
+                        Phase::Resident { epoch } | Phase::EnsuringDurability { epoch, .. } => {
+                            epoch
+                        }
                         _ => return None,
                     };
                     (!cell.quiescing
                         && !self.is_active(id)
                         && !matches!(cell.alarm, Some(AlarmState::Firing { .. })))
-                    .then(|| (id.clone(), epoch, retired_durability))
+                    .then(|| (id.clone(), epoch))
                 })
             })
-            .map(|(cell, epoch, retired_durability)| WorkerRoute {
-                cell,
-                epoch,
-                retired_durability,
-            });
+            .map(|(cell, epoch)| WorkerRoute { cell, epoch });
 
         if let Some(route) = &route {
             self.worker_cursor = Some(route.cell.clone());
             self.activate_request(request, route.cell.clone());
             if let Some(mut cell) = self.cells.remove(&route.cell) {
                 if matches!(cell.phase, Phase::EnsuringDurability { .. }) {
-                    self.cancel_eviction(&route.cell, &mut cell, route.epoch);
+                    self.cancel_eviction(
+                        &route.cell,
+                        &mut cell,
+                        route.epoch,
+                        EvictCancellation::Activity,
+                        effects,
+                    );
                 }
                 Self::record_local_request(&mut cell, request, self.now_mono_ms);
                 self.cells.insert(route.cell.clone(), cell);
@@ -2737,11 +2767,10 @@ impl State {
                 // a firing alarm holds the cell out of dormancy. All three
                 // keep the ownership record claimed while they wait.
                 //
-                // `StopRuntime` is the deliberate exception. It has no failure
-                // handling to reuse -- a stop cannot fail, it can only not
-                // finish -- so abandoning one would mean declaring a runtime
-                // gone while it may still be running. That needs a decision,
-                // not a timer.
+                // `StopRuntime` is the deliberate exception. A returned host
+                // error can take the failed-stop path, but a pending release
+                // can still own the runtime and its database. Expiring that
+                // operation would permit an unsafe concurrent restart.
                 // A restore is a sequence of individually bounded object-store
                 // requests. Its total duration scales with the replica. The
                 // shell cannot cancel the task, so retiring the core op would
@@ -2890,7 +2919,7 @@ impl State {
             // An unprovable snapshot leaves the cell resident. Evicting on a
             // proof that never arrived is the one outcome that loses data.
             Some(Phase::EnsuringDurability { .. }) => {
-                self.durability_checked(op, Err(Failure::Ambiguous), effects)
+                self.durability_checked(op, Err(EvictFailure::DurabilityTimeout), effects)
             }
             _ => {}
         }
@@ -3103,7 +3132,7 @@ impl State {
             // here re-emits EnsureDurable forever while the cell has no pin.
             let safe_drain_refresh = self.draining && (at_ms.is_none() || covered);
             if !safe_drain_refresh {
-                self.cancel_eviction(id, &mut cell, epoch);
+                self.cancel_eviction(id, &mut cell, epoch, EvictCancellation::Alarm, effects);
             }
         }
         // Runtime observations can arrive before `AlarmFinished`. The alarm
@@ -3249,7 +3278,7 @@ impl State {
             }
             Phase::Resident { epoch } => epoch,
             Phase::EnsuringDurability { epoch, .. } => {
-                self.cancel_eviction(id, &mut cell, epoch);
+                self.cancel_eviction(id, &mut cell, epoch, EvictCancellation::Alarm, effects);
                 epoch
             }
             Phase::Fenced => {
@@ -3526,7 +3555,7 @@ impl State {
                 // counts against `max_evictions` forever and eventually
                 // stands every future eviction down.
                 let epoch = *epoch;
-                self.cancel_eviction(&id, &mut cell, epoch);
+                self.cancel_eviction(&id, &mut cell, epoch, EvictCancellation::Activity, effects);
                 Self::record_local_request(&mut cell, request, self.now_mono_ms);
                 self.complete_request(&id, request, Ok(Route::Local), effects);
             }
@@ -3764,6 +3793,10 @@ impl State {
                 Phase::ReadingOwner { .. }
                 | Phase::ReadingNodeLease { .. }
                 | Phase::RecoveringOwnerLog { .. }
+                // Backoff retains its callers after returning the activation
+                // permit. Retire its phase too, or the retry timer restarts
+                // cold work while the shell prepares the local reload.
+                | Phase::WaitingOwnerLogRecovery { .. }
                 | Phase::ReadingCapacity { .. }
                 | Phase::Acquiring { .. }
                 | Phase::ReconcilingAcquire { .. } => Some(Phase::Inactive),
@@ -3780,6 +3813,9 @@ impl State {
                 }
                 self.finish_requests(&id, &mut cell, Err(RequestError::NodeFenced), effects);
                 set_phase(&mut self.occupied, &mut cell, fallback);
+                // A later cold route must not inherit failures from the
+                // recovery episode that preserve just retired.
+                cell.owner_log_recovery_attempts = 0;
                 cell.waiting_for = None;
                 cell.waiting_activation = None;
                 cell.alarm_wake = false;
@@ -4968,6 +5004,12 @@ impl State {
         let Phase::Cleaning { epoch, cause, .. } = cell.phase else {
             unreachable!()
         };
+        if matches!(cause, StopCause::Evict { .. }) {
+            // The stop completed even when waiting demand immediately starts
+            // a new runtime. Its callers await this operation, not absence
+            // after the next activation.
+            self.finish_eviction(op, Ok(EvictSuccess::Evicted), effects);
+        }
         match cause {
             StopCause::Cleanup => {
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
@@ -5048,6 +5090,15 @@ impl State {
         self.cells.insert(id, cell);
         self.pump_capacity(effects);
         self.shed_toward_floor(effects);
+        // The permit this stop returned is spent here, not on the next load
+        // sample. Without this re-entry the idle path drains at
+        // `max_evictions` cells per sampling period, whatever the proof and
+        // stop take: 10,000 idle rooms hibernated at exactly four per second
+        // for 42 minutes (GCE, 2026-09-03), and raising the bound only
+        // raised the rate. The clock is the last one an event carried, which
+        // is at or before the real time, so a cell idle at the sample is
+        // still idle here.
+        self.evict_idle(self.now_mono_ms, effects);
     }
 
     /// A bounded stop gave up. The host dropped the runtime and kept the
@@ -5058,7 +5109,7 @@ impl State {
     /// the cell again instead of stopping it on every sample. Without this a
     /// cell whose final proof stalled retried every 10 s without end and
     /// answered nobody (the 2026-09-03 whale runs).
-    fn runtime_stop_failed(&mut self, op: OpId, effects: &mut Vec<Effect>) {
+    fn runtime_stop_failed(&mut self, op: OpId, error: EvictError, effects: &mut Vec<Effect>) {
         let Some(id) = self.take_cell_op(
             op,
             |cell| matches!(cell.phase, Phase::Cleaning { op: current, .. } if current == op),
@@ -5073,6 +5124,8 @@ impl State {
             matches!(cause, StopCause::Evict { .. }),
             "only an eviction stop is bounded"
         );
+        self.finish_eviction(op, Err(error), effects);
+
         cell.isolate = None;
         cell.evict_rebalance = false;
         cell.handoff = false;
@@ -5281,7 +5334,7 @@ impl State {
     fn durability_checked(
         &mut self,
         op: OpId,
-        result: Result<(), Failure>,
+        result: Result<(), EvictFailure>,
         effects: &mut Vec<Effect>,
     ) {
         let now = self.now_mono_ms;
@@ -5300,6 +5353,9 @@ impl State {
                 // accesses split where a method call cannot.
                 let stop = self.next_op;
                 self.next_op = self.next_op.checked_add(1).expect("operation id exhausted");
+                if let Some(requests) = self.eviction_notifications.remove(&op) {
+                    self.eviction_notifications.insert(stop, requests);
+                }
                 self.cell_ops.insert(stop, id.clone());
                 let rebalance = cell.evict_rebalance;
                 set_phase(
@@ -5319,10 +5375,11 @@ impl State {
                     bounded: !self.draining,
                 });
             }
-            Err(_) => {
+            Err(reason) => {
                 set_phase(&mut self.occupied, cell, Phase::Resident { epoch });
                 cell.eviction_refused_mono_ms = Some(now);
                 self.eviction_permits.remove(&id);
+                self.finish_eviction(op, Err(EvictError::Failed(reason)), effects);
             }
         }
     }
@@ -5330,7 +5387,94 @@ impl State {
     /// Evict on demand. Local, like an idle eviction: the caller asked
     /// this node to drop the cell, not to give it away.
     fn evict(&mut self, id: &str, effects: &mut Vec<Effect>) {
-        self.begin_eviction(id, false, effects);
+        let _ = self.begin_eviction(id, false, effects);
+    }
+
+    fn evict_requested(&mut self, request: RequestId, id: CellId, effects: &mut Vec<Effect>) {
+        let mut admitted_effects = Vec::new();
+        let result = self
+            .admit_eviction(&id, &mut admitted_effects)
+            .map(|op| match op {
+                Some(op) => {
+                    self.eviction_notifications
+                        .entry(op)
+                        .or_default()
+                        .insert(request);
+                    EvictionAdmission::Pending
+                }
+                None => EvictionAdmission::Absent,
+            });
+        effects.push(Effect::EvictionAdmission { request, result });
+        effects.extend(admitted_effects);
+    }
+
+    fn finish_eviction(
+        &mut self,
+        op: OpId,
+        result: Result<EvictSuccess, EvictError>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(requests) = self.eviction_notifications.remove(&op) {
+            effects.extend(
+                requests
+                    .into_iter()
+                    .map(|request| Effect::EvictionFinished { request, result }),
+            );
+        }
+    }
+
+    fn admit_eviction(
+        &mut self,
+        id: &str,
+        effects: &mut Vec<Effect>,
+    ) -> Result<Option<OpId>, EvictError> {
+        let refuse = |reason| Err(EvictError::Refused(reason));
+        if !self.ready_to_serve() || self.confirming {
+            return refuse(EvictRefusal::NodeUnavailable);
+        }
+        if self.is_active(id) {
+            return refuse(EvictRefusal::CellActive);
+        }
+        let cell = self.cells.get(id);
+        let phase = cell.map(|cell| &cell.phase);
+        match phase {
+            Some(Phase::EnsuringDurability { op, .. }) => return Ok(Some(*op)),
+            Some(Phase::Cleaning {
+                op,
+                cause: StopCause::Evict { .. },
+                ..
+            }) => return Ok(Some(*op)),
+            _ => {}
+        }
+        // A dormant phase can still owe an ownership release. The operation
+        // index is validated against these slots, so no global scan is needed.
+        let transitioning = cell.is_some_and(|cell| {
+            cell.releasing.is_some()
+                || cell.waiting_for.is_some()
+                || cell.waiting_activation.is_some()
+                || !cell.requests.is_empty()
+                || cell.quiescing
+                || cell.swapping
+                || cell.handoff
+                || cell.confirming
+                || cell.resume_demand
+        });
+        if transitioning {
+            return refuse(EvictRefusal::CellTransitioning);
+        }
+        match phase {
+            None | Some(Phase::Inactive | Phase::Dormant { .. } | Phase::Remote { .. }) => {
+                // A wake hint can outlive a remote lookup or an eviction with
+                // a future alarm. Refusing on the hint alone would reject
+                // settled absence; only pending lifecycle work prevents it.
+                Ok(None)
+            }
+            Some(Phase::Resident { .. }) => self
+                .begin_eviction(id, false, effects)
+                .map(Some)
+                .map_err(EvictError::Refused),
+            _ => refuse(EvictRefusal::CellTransitioning),
+        }
     }
 
     /// Shutdown handoff: give every resident cell away by releasing its
@@ -5395,7 +5539,7 @@ impl State {
         // ordinary eviction state without spending another handoff permit.
         let quiescing: Vec<CellId> = self.quiescing_cells.iter().cloned().collect();
         for id in quiescing {
-            self.begin_eviction(&id, true, effects);
+            let _ = self.begin_eviction(&id, true, effects);
         }
 
         // A full batch cannot nominate another cell. Stop before rebuilding
@@ -5503,7 +5647,7 @@ impl State {
                 keep_hibernatable: false,
             });
             in_flight += 1;
-            self.begin_eviction(&id, true, effects);
+            let _ = self.begin_eviction(&id, true, effects);
         }
         // A cell evicted before the drain kept its record on this node --
         // a sticky eviction, hibernation, or a release whose write failed
@@ -5631,42 +5775,45 @@ impl State {
         }
     }
 
-    fn begin_eviction(&mut self, id: &str, rebalance: bool, effects: &mut Vec<Effect>) -> bool {
-        let alarm_is_imminent = self
-            .cells
-            .get(id)
-            .is_some_and(|cell| self.alarm_is_imminent(cell));
+    fn begin_eviction(
+        &mut self,
+        id: &str,
+        rebalance: bool,
+        effects: &mut Vec<Effect>,
+    ) -> Result<OpId, EvictRefusal> {
+        let Some(cell) = self.cells.get(id) else {
+            return Err(EvictRefusal::CellTransitioning);
+        };
         // Only while there is room to spare. Holding a cell to save a wake is
         // worth it on an idle node and indefensible on a full one: the window
         // defaults to an hour, so on an alarm-driven workload this would hold
         // most of the node and pin it at its ceiling -- trading a real
         // admission failure for a saved activation. Under pressure the node
         // takes the wake.
-        if alarm_is_imminent && !self.shedding && !self.draining {
-            return false;
+        if self.alarm_is_imminent(cell) && !self.shedding && !self.draining {
+            return Err(EvictRefusal::AlarmImminent);
         }
-        let alarm_is_safe = self.cells.get(id).is_some_and(|cell| {
-            cell.alarm
-                .as_ref()
-                .is_none_or(|alarm| matches!(alarm, AlarmState::Armed { covered: true, .. }))
-        });
-        if !self.is_hibernatable(id) || !alarm_is_safe {
-            return false;
+        if self.is_active(id) {
+            return Err(EvictRefusal::CellActive);
+        }
+        let Phase::Resident { epoch } = cell.phase else {
+            return Err(EvictRefusal::CellTransitioning);
+        };
+        if !cell
+            .alarm
+            .as_ref()
+            .is_none_or(|alarm| matches!(alarm, AlarmState::Armed { covered: true, .. }))
+        {
+            return Err(EvictRefusal::AlarmUncovered);
         }
         // The permit is taken here, so the ceiling holds here. A balancing
         // batch reserves more cells than permits, and the pump promotes
         // them as permits return.
         if self.eviction_permits.len() >= self.eviction_ceiling() {
-            return false;
+            return Err(EvictRefusal::ConcurrencyLimit);
         }
-        let Some(Phase::Resident { epoch }) = self.cells.get(id).map(|cell| &cell.phase) else {
-            return false;
-        };
-        let epoch = *epoch;
         let op = self.cell_op(id);
-        let Some(cell) = self.cells.get_mut(id) else {
-            return false;
-        };
+        let cell = self.cells.get_mut(id).expect("resident cell checked above");
         cell.evict_rebalance = rebalance;
         set_phase(
             &mut self.occupied,
@@ -5688,7 +5835,7 @@ impl State {
             // `Effect::EnsureDurable::revocable` records the argument.
             revocable: !self.draining,
         });
-        true
+        Ok(op)
     }
 
     fn shed_one(&mut self, effects: &mut Vec<Effect>) {
@@ -5711,7 +5858,7 @@ impl State {
             return;
         }
         if let Some(victim) = self.shed_candidate() {
-            self.begin_eviction(&victim, self.rebalances(), effects);
+            let _ = self.begin_eviction(&victim, self.rebalances(), effects);
         }
     }
 
@@ -5879,6 +6026,13 @@ impl State {
         let Some(idle_ms) = self.config.idle_evict_ms else {
             return;
         };
+        // A latched node is already walking down on its own schedule, and
+        // `shed_toward_floor` prefers the same cold cells. This is reached
+        // from every eviction stop as well as from the sample, so the guard
+        // lives here rather than at each caller.
+        if self.shedding {
+            return;
+        }
         // Fill the permits, exactly as `shed_toward_floor` does. One
         // candidate per sample drains an idle backlog at the sampling
         // period: a few thousand parked hibernatable cells — the shape
@@ -5898,7 +6052,7 @@ impl State {
                 return;
             };
             // Idle eviction is a local residency decision, not a handoff.
-            if !self.begin_eviction(&candidate, false, effects) {
+            if self.begin_eviction(&candidate, false, effects).is_err() {
                 return;
             }
         }
@@ -6080,7 +6234,10 @@ impl State {
             let Some(victim) = self.shed_candidate() else {
                 return;
             };
-            if !self.begin_eviction(&victim, self.rebalances(), effects) {
+            if self
+                .begin_eviction(&victim, self.rebalances(), effects)
+                .is_err()
+            {
                 return;
             }
         }
@@ -6388,6 +6545,19 @@ impl State {
             // never match a lookup again. The release op survives on purpose:
             // `owner_released` still consumes it after a fence, as it did
             // when resolution was a scan.
+            if let Phase::EnsuringDurability { op, .. }
+            | Phase::Cleaning {
+                op,
+                cause: StopCause::Evict { .. },
+                ..
+            } = cell.phase
+            {
+                self.finish_eviction(
+                    op,
+                    Err(EvictError::Cancelled(EvictCancellation::NodeFenced)),
+                    effects,
+                );
+            }
             if let Some(stale) = phase_op(&cell.phase) {
                 self.cell_ops.remove(&stale);
             }
@@ -6456,6 +6626,7 @@ fn event_mono_ms(event: &Event) -> Option<u64> {
         | Event::SelfNodeLeaseRead { now_mono_ms, .. }
         | Event::NodeLeaseCasCompleted { now_mono_ms, .. }
         | Event::RequestAt { now_mono_ms, .. }
+        | Event::EvictRequested { now_mono_ms, .. }
         | Event::CapacityRequestAt { now_mono_ms, .. }
         | Event::HandoffRequestAt { now_mono_ms, .. }
         | Event::WebSocketRequestAt { now_mono_ms, .. }
@@ -6641,12 +6812,26 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             ..
         } => state.generation_changed(generation, max_age_ms, &eager_classes),
         Event::Published { op, result } => state.published(op, result, &mut effects),
-        Event::DurabilityChecked { op, result } => {
-            state.durability_checked(op, result, &mut effects)
-        }
+        Event::DurabilityChecked { op, result } => state.durability_checked(
+            op,
+            result.map_err(|_| EvictFailure::Durability),
+            &mut effects,
+        ),
         Event::RuntimeStopped { op } => state.runtime_stopped(op, &mut effects),
-        Event::RuntimeStopFailed { op } => state.runtime_stop_failed(op, &mut effects),
+        Event::RuntimeStopFailed { op } => state.runtime_stop_failed(
+            op,
+            EvictError::Failed(EvictFailure::RuntimeStop),
+            &mut effects,
+        ),
+        Event::RuntimeStopCancelled { op } => state.runtime_stop_failed(
+            op,
+            EvictError::Cancelled(EvictCancellation::Activity),
+            &mut effects,
+        ),
         Event::Evict { cell } => state.evict(&cell, &mut effects),
+        Event::EvictRequested { request, cell, .. } => {
+            state.evict_requested(request, cell, &mut effects)
+        }
         Event::LoadSampled { load, now_mono_ms } => {
             state.load_sampled(load, now_mono_ms, &mut effects)
         }

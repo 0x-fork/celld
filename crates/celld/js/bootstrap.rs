@@ -796,7 +796,7 @@ thread_local! {
 }
 
 /// Measure lease expiry without waiting through the production handler budget.
-/// The override is thread-local because the private runtime corpus builds
+/// The override is thread-local because runtime tests build
 /// unrelated Workers in parallel, and a process environment variable would
 /// silently shorten their leases too.
 #[cfg(celld_internal_tests)]

@@ -243,7 +243,7 @@ const KV_PUT_SQL: &str = "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
      ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v";
 const KV_DELETE_SQL: &str = "DELETE FROM _cf_KV WHERE scope=?1 AND k=?2";
 
-/// The number of SQL compilations so far, for the internal test hooks: a
+/// The number of SQL compilations so far, for a test assertion: a
 /// warm cell's gets and puts must not move it.
 #[cfg(celld_internal_tests)]
 pub fn sql_prepares_for_test() -> u64 {
@@ -540,18 +540,24 @@ fn is_reserved_sql_name(name: &str) -> bool {
 
 fn valid_sql_boolean(value: &str) -> bool {
     let value = value.trim();
-    let value = if value.len() >= 2
-        && ((value.starts_with('\'') && value.ends_with('\''))
-            || (value.starts_with('"') && value.ends_with('"')))
-    {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    };
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(value);
     matches!(
         value.to_ascii_lowercase().as_str(),
         "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0"
     )
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod internal_tests {
+    include!(env!("CELLD_INTERNAL_STORAGE_TESTS"));
 }
 
 fn valid_sql_i32(value: &str) -> bool {

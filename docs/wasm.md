@@ -27,6 +27,13 @@ celld compiles each wasm module once for the whole process. Every
 isolate after the first one reuses the compiled module, so a cell
 activation does not pay the compilation again.
 
+## Example
+
+The [WebAssembly example](../examples/wasm) compiles a Rust Durable Object and
+imports its WebAssembly module.
+
+<!-- celld-example: wasm -->
+
 ## Prebuilt Workers
 
 With `no_bundle: true`, celld preserves the entry JavaScript byte for byte.

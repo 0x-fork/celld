@@ -5476,9 +5476,19 @@ var require_stream = __commonJS({
     "CountQueuingStrategy", "TextEncoderStream", "TextDecoderStream",
     "CompressionStream", "DecompressionStream",
   ]) {
+    // The getter keeps the class lazy, but a getter alone makes the export
+    // read-only, and a CommonJS dependency that swaps a stream class at module
+    // scope would take the Worker down at load. The setter replaces the
+    // accessor with a plain value, so the patch stays on this module object
+    // and does not reach the global.
     Object.defineProperty(web, name, {
       enumerable: true, configurable: true,
       get: () => globalThis[name],
+      set: (value) => {
+        Object.defineProperty(web, name, {
+          value, writable: true, enumerable: true, configurable: true,
+        });
+      },
     });
   }
 

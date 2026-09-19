@@ -409,6 +409,35 @@ impl Generation {
             pool.reap_empty();
         }
     }
+
+    /// The isolates this generation holds right now, for `/state`.
+    pub(crate) fn isolate_census(&self) -> IsolateCensus {
+        IsolateCensus {
+            stateless: self.stateless.isolates.census(),
+            services: self
+                .services
+                .iter()
+                .map(|(name, service)| (name.clone(), service.isolates.census()))
+                .collect(),
+            cells: self
+                .cell_isolates
+                .iter()
+                .map(|(script, pool)| (script.clone(), pool.census()))
+                .collect(),
+        }
+    }
+}
+
+/// The isolates one generation holds, by the pool they belong to, as
+/// `/state` reports them.
+#[derive(Debug, serde::Serialize)]
+pub struct IsolateCensus {
+    /// The pool that serves the primary script's stateless handlers.
+    pub stateless: crate::pool::PoolCensus,
+    /// The pools of the named services, by service name.
+    pub services: BTreeMap<String, crate::pool::PoolCensus>,
+    /// The pools the cells live in, by Worker script.
+    pub cells: BTreeMap<String, crate::pool::PoolCensus>,
 }
 
 /// The generation an isolate was built for, installed as an isolate slot by

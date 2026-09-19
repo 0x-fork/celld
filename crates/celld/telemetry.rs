@@ -491,7 +491,7 @@ fn decide_with_sampler(
     (trace_id, sampled)
 }
 
-/// The sampler is private, so the private suite reaches the decision
+/// The sampler is private, so tests reach the decision
 /// through the ratio the configuration carries.
 #[cfg(celld_internal_tests)]
 #[doc(hidden)]

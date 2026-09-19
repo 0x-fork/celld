@@ -56,6 +56,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "worker_loaders",
     "containers",
     "no_bundle",
+    "define",
+    "rules",
 ];
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
@@ -284,6 +286,8 @@ struct Project {
     /// bundle, so it must not depend on the working directory celld was
     /// invoked from — identical source would otherwise hash two ways.
     entry: Option<String>,
+    /// What the config's `define` and `rules` add to the esbuild run.
+    bundle: BundleConfig,
     assets: Option<ProjectAssets>,
     metadata: Value,
     do_classes: Vec<String>,
@@ -295,6 +299,69 @@ struct Project {
     has_queues: bool,
     has_r2: bool,
     containers: Vec<ContainerDecl>,
+}
+
+/// The two Wrangler bundling knobs that celld forwards to esbuild.
+///
+/// Both are pass-throughs, so celld validates their shape and leaves their
+/// meaning to esbuild. They travel together because both are build inputs and
+/// neither reaches the deployment metadata: a change to either changes the
+/// bundle bytes, and the deployment version hashes those.
+struct BundleConfig {
+    /// `define` as `--define:KEY=VALUE`. Each value is a JavaScript
+    /// expression, which is what Wrangler and esbuild both take.
+    define: BTreeMap<String, String>,
+    /// `rules` as `--loader:.EXT=LOADER`, plus celld's own default rule.
+    loaders: BTreeMap<String, Loader>,
+}
+
+/// The esbuild loaders a Wrangler module rule can ask for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Loader {
+    /// Wrangler's `Text`. The file becomes a string in the bundle.
+    Text,
+    /// Wrangler's `Data`. The file becomes a byte array in the bundle.
+    Binary,
+    /// Wrangler's `CompiledWasm`. The file becomes a sibling module that the
+    /// runtime serves as a compiled `WebAssembly.Module`.
+    Copy,
+}
+
+impl Loader {
+    fn esbuild_name(self) -> &'static str {
+        match self {
+            Loader::Text => "text",
+            Loader::Binary => "binary",
+            Loader::Copy => "copy",
+        }
+    }
+
+    /// The `rules[].type` a config writes for this loader. An error names the
+    /// config's own word, not celld's internal one.
+    fn rule_type(self) -> &'static str {
+        match self {
+            Loader::Text => "Text",
+            Loader::Binary => "Data",
+            Loader::Copy => "CompiledWasm",
+        }
+    }
+}
+
+impl Default for BundleConfig {
+    fn default() -> Self {
+        // Wasm is a sibling module (Wrangler's built-in `CompiledWasm` rule).
+        // The `copy` loader makes esbuild resolve each wasm import like any
+        // other import (importer-relative, node_modules, deduplicated) and
+        // rewrite the specifier to the copied file, so the bundle and the
+        // emitted files agree on names. It lives in the same map as the
+        // configured rules, so a config that gives `.wasm` a conflicting rule
+        // is refused by the same check that catches two conflicting rules,
+        // rather than emitting two `--loader` arguments for one extension.
+        Self {
+            define: BTreeMap::new(),
+            loaders: BTreeMap::from([(".wasm".to_string(), Loader::Copy)]),
+        }
+    }
 }
 
 /// One `containers[]` entry as written, before its image is resolved.
@@ -550,7 +617,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 wasm.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(BundleOutput { bundle, wasm })
             } else {
-                run_esbuild(&root, entry)
+                run_esbuild(&root, entry, &project.bundle)
             }
         })
         .transpose()?;
@@ -1248,6 +1315,24 @@ fn read_project(
     if no_bundle && main.is_none() {
         bail!("config sets `no_bundle` without `main`");
     }
+    let bundle = read_bundle_config(object)?;
+    // `define` and `rules` describe the esbuild run, and `no_bundle` is the
+    // absence of one. Accepting both would produce a deployment that silently
+    // omits every substitution the config asks for, which is the failure the
+    // caller wrote those keys to prevent.
+    if no_bundle {
+        let ignored: Vec<&str> = ["define", "rules"]
+            .into_iter()
+            .filter(|key| object.contains_key(*key))
+            .collect();
+        if !ignored.is_empty() {
+            bail!(
+                "config sets `no_bundle` with `{}`; those keys only change the \
+                 esbuild run, and `no_bundle` does not run esbuild",
+                ignored.join("` and `")
+            );
+        }
+    }
     let assets = object
         .get("assets")
         .map(|value| read_asset_project(value, root, object))
@@ -1736,14 +1821,18 @@ fn read_project(
         if !valid_binding(binding) {
             bail!("invalid worker loader binding name: {binding:?}");
         }
-        // Cloudflare carries the per-loader Dynamic Workers options inside the
-        // entry: `limits`, `tails`, and `allowExperimental`. celld honours none
-        // of them, so accepting the key would deploy the project clean and drop
-        // the option the author asked for. This follows the r2 `jurisdiction`
-        // refusal above, and it is the config half of the gaps #836 tracks.
+        // Wrangler's worker_loaders entries contain only a binding name.
+        // Resource limits and tail Fetchers belong to WorkerCode, because the
+        // loader can create Workers with different limits and tail targets.
+        // Refuse misplaced options instead of deploying without their effect.
         for key in loader.keys() {
             if key != "binding" {
-                bail!("worker loader {binding} sets `{key}`, which celld does not have");
+                match key.as_str() {
+                    "limits" => bail!("worker loader {binding} sets `limits`; set limits in WorkerCode or getEntrypoint()"),
+                    "tails" => bail!("worker loader {binding} sets `tails`; set tails in WorkerCode"),
+                    "allowExperimental" => bail!("worker loader {binding} sets `allowExperimental`, which celld does not support"),
+                    _ => bail!("worker loader {binding} sets `{key}`, which is not a supported worker_loaders option"),
+                }
             }
         }
         bindings.push(json!({
@@ -1850,6 +1939,7 @@ fn read_project(
         script_name,
         no_bundle,
         entry: main,
+        bundle,
         assets,
         metadata: Value::Object(metadata),
         do_classes,
@@ -1862,6 +1952,114 @@ fn read_project(
         has_r2: !r2_buckets.is_empty(),
         containers,
     })
+}
+
+/// The config's `define` and `rules`, as esbuild arguments.
+///
+/// Wrangler owns the spelling of both keys, so celld reads them as written
+/// rather than inventing a celld-only escape hatch: a project keeps one
+/// config, and a later move back to Wrangler bundles the same way.
+fn read_bundle_config(object: &Map<String, Value>) -> anyhow::Result<BundleConfig> {
+    let mut bundle = BundleConfig::default();
+    match object.get("define") {
+        None => {}
+        Some(Value::Object(entries)) => {
+            for (key, value) in entries {
+                let Some(value) = value.as_str() else {
+                    bail!("config `define` value for {key:?} must be a string");
+                };
+                // esbuild takes one `--define:KEY=VALUE` argument and splits
+                // it at the first `=`. A key carrying `=` would move that
+                // split and define a different name than the config names,
+                // and a key carrying whitespace or a control character cannot
+                // be a JavaScript reference at all.
+                if key.is_empty()
+                    || key.contains('=')
+                    || key.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    bail!("invalid `define` key: {key:?}");
+                }
+                bundle.define.insert(key.clone(), value.to_string());
+            }
+        }
+        Some(_) => bail!("config `define` must be an object"),
+    }
+    let rules = match object.get("rules") {
+        None => &[][..],
+        Some(Value::Array(rules)) => rules.as_slice(),
+        Some(_) => bail!("config `rules` must be an array"),
+    };
+    for rule in rules {
+        let Value::Object(rule) = rule else {
+            bail!("module rule must be an object with a `type` and `globs`");
+        };
+        for key in rule.keys() {
+            if !matches!(key.as_str(), "type" | "globs") {
+                bail!("module rule sets `{key}`, which celld does not have");
+            }
+        }
+        let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
+            bail!("module rule has no `type` string");
+        };
+        let loader = match rule_type {
+            "Text" => Loader::Text,
+            "Data" => Loader::Binary,
+            "CompiledWasm" => Loader::Copy,
+            other => bail!(
+                "module rule type {other:?} is not supported; celld supports \
+                 Text, Data, and CompiledWasm"
+            ),
+        };
+        let Some(Value::Array(globs)) = rule.get("globs") else {
+            bail!("module rule {rule_type} must have a `globs` array");
+        };
+        if globs.is_empty() {
+            bail!("module rule {rule_type} has no globs");
+        }
+        for glob in globs {
+            let Some(glob) = glob.as_str() else {
+                bail!("module rule glob must be a string");
+            };
+            let extension = rule_extension(glob)?;
+            // Two rules that claim one extension have no single answer, and
+            // picking either silently loads half the files the config lists
+            // the wrong way.
+            if let Some(previous) = bundle.loaders.insert(extension.clone(), loader) {
+                if previous != loader {
+                    bail!(
+                        "two module rules claim {extension:?}: {} and {}",
+                        previous.rule_type(),
+                        loader.rule_type()
+                    );
+                }
+            }
+        }
+    }
+    Ok(bundle)
+}
+
+/// The file extension a Wrangler module glob selects.
+///
+/// esbuild chooses a loader by extension, and Wrangler chooses one by glob, so
+/// only a glob that is exactly an extension match crosses that gap. celld
+/// refuses every other glob rather than load a different set of files than the
+/// config asks for.
+fn rule_extension(glob: &str) -> anyhow::Result<String> {
+    let extension = glob
+        .strip_prefix("**/*")
+        .or_else(|| glob.strip_prefix('*'))
+        .filter(|extension| {
+            extension.strip_prefix('.').is_some_and(|name| {
+                !name.is_empty() && !name.contains(['*', '?', '.', '/', '\\', '[', '{'])
+            })
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "module rule glob {glob:?} is not an extension match; celld \
+                 supports a glob of the form `**/*.ext`"
+            )
+        })?;
+    Ok(extension.to_string())
 }
 
 /// The config's `containers[]`. Each entry attaches a container to one
@@ -2037,7 +2235,7 @@ fn optional_queue_u32(value: &Value, field: &str) -> anyhow::Result<Option<u32>>
 /// the same rule for a second reason: the name becomes a key prefix inside the
 /// fleet bucket, and this rule is what keeps it a single path segment, so a
 /// binding cannot address the fleet's own deployment, cell, or lease keys.
-fn valid_resource_name(name: &str) -> bool {
+pub(crate) fn valid_resource_name(name: &str) -> bool {
     name.len() <= 64
         && name
             .chars()
@@ -2611,7 +2809,7 @@ fn collect_unbundled_wasm(
     Ok(())
 }
 
-fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
+fn run_esbuild(root: &Path, entry: &str, config: &BundleConfig) -> anyhow::Result<BundleOutput> {
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
@@ -2633,43 +2831,46 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
   }
   return builtin;
 };"#;
-    let output = Command::new(&binary)
-        .current_dir(root)
-        .arg(entry)
-        .arg("--bundle")
-        .arg("--format=esm")
-        .arg("--platform=browser")
-        .arg("--target=es2024")
-        .arg("--conditions=workerd,worker,browser")
-        .arg(format!("--banner:js={commonjs_builtin_bridge}"))
-        .arg("--external:node:*")
-        .arg("--external:cloudflare:*")
-        .args(
-            crate::js::BARE_NODE_BUILTINS
-                .iter()
-                .map(|specifier| format!("--external:{specifier}")),
-        )
-        // Wasm becomes a sibling module (Wrangler's CompiledWasm rule). The
-        // `copy` loader makes esbuild resolve each wasm import like any other
-        // import (importer-relative, node_modules, deduplicated) and rewrite
-        // the specifier to the copied file, so the bundle and the emitted
-        // files agree on names; the runtime serves each file as a compiled
-        // WebAssembly.Module default export.
-        .arg("--loader:.wasm=copy")
-        .arg(format!("--outdir={}", outdir.path().display()))
-        .arg("--entry-names=index")
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow!(
-                    "esbuild not found ({binary}).\n\
+    let output =
+        Command::new(&binary)
+            .current_dir(root)
+            .arg(entry)
+            .arg("--bundle")
+            .arg("--format=esm")
+            .arg("--platform=browser")
+            .arg("--target=es2024")
+            .arg("--conditions=workerd,worker,browser")
+            .arg(format!("--banner:js={commonjs_builtin_bridge}"))
+            .arg("--external:node:*")
+            .arg("--external:cloudflare:*")
+            .args(
+                crate::js::BARE_NODE_BUILTINS
+                    .iter()
+                    .map(|specifier| format!("--external:{specifier}")),
+            )
+            .args(config.loaders.iter().map(|(extension, loader)| {
+                format!("--loader:{extension}={}", loader.esbuild_name())
+            }))
+            .args(
+                config
+                    .define
+                    .iter()
+                    .map(|(key, value)| format!("--define:{key}={value}")),
+            )
+            .arg(format!("--outdir={}", outdir.path().display()))
+            .arg("--entry-names=index")
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!(
+                        "esbuild not found ({binary}).\n\
                      `celld deploy` bundles with esbuild; install it and retry,\n\
                      or set CELLD_ESBUILD to its path."
-                )
-            } else {
-                anyhow!("run esbuild: {error}")
-            }
-        })?;
+                    )
+                } else {
+                    anyhow!("run esbuild: {error}")
+                }
+            })?;
     if !output.status.success() {
         bail!(
             "esbuild failed:\n{}",
@@ -2678,12 +2879,31 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
     }
     let bundle =
         std::fs::read(outdir.path().join("index.js")).context("read esbuild output bundle")?;
-    // The copied wasm files land beside the bundle; each becomes its own
-    // deployed module under the name the rewritten imports use.
+    // The copied files land beside the bundle; each becomes its own deployed
+    // module under the name the rewritten imports use. Only the `copy` loader
+    // emits a sibling — `text` and `binary` put the file inside the bundle —
+    // so the emitted set follows the same extension map the run used. It must
+    // follow that map and not a fixed `.wasm` test: a config that gives
+    // `.wasm` a different rule emits no wasm, and a `CompiledWasm` rule on
+    // another extension emits one under that extension.
+    let copied: BTreeSet<&str> = config
+        .loaders
+        .iter()
+        .filter(|(_, loader)| **loader == Loader::Copy)
+        .map(|(extension, _)| extension.as_str())
+        .collect();
     let mut wasm = Vec::new();
     for dirent in std::fs::read_dir(outdir.path()).context("read esbuild output directory")? {
         let path = dirent?.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("wasm") {
+        let is_copied = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                // The bundle already holds the main-module slot. A rule that
+                // claims `.js` would otherwise deploy it a second time.
+                name != "index.js" && copied.iter().any(|extension| name.ends_with(extension))
+            });
+        if is_copied {
             let name = path
                 .file_name()
                 .expect("read_dir entries have a file name")

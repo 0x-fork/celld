@@ -12,7 +12,9 @@ alternative sink sends the same data to an OpenTelemetry collector.
 
 The schema is version `v0-unstable`. The column names can change
 before a stable release, and each file carries the schema version in
-its object metadata.
+its object metadata under the name `celld-schema`. Azure Blob Storage
+does not accept a hyphen in a metadata name, so on an `az://` bucket
+the name is `celld_schema`.
 
 ## Configuration
 

@@ -5,14 +5,13 @@ at a time, so two machines never write the same database. And celld does
 not answer a write until that write survives a failure, so nothing you
 were told succeeded is lost.
 
-This page is how both promises are kept. Fencing is the part that keeps
-the first one true when a node is slow, paused, or cut off from the
-network: celld refuses that node's writes rather than trusting it to
-notice it lost the cell. Both claims rest on the object
-store, so this page starts with what you must provide: a bucket with
-working conditional writes and ranged reads, and a supervisor that
-restarts the process. The mechanism follows, so you can check the
-argument against the code.
+This page explains how celld keeps both promises. Fencing prevents a
+slow, paused, or disconnected node's writes from damaging the current
+owner's data after it loses a cell.
+Each ownership epoch has a separate storage prefix, so a stale node's
+writes cannot overwrite the current owner's data.
+Both guarantees require a bucket with working conditional writes and
+ranged reads, and a supervisor that restarts the process.
 
 ## What the bucket must provide
 
@@ -34,7 +33,7 @@ Backblaze B2, Hetzner Object Storage, and DigitalOcean Spaces do not
 implement the required conditional writes. celld is not correct on such
 a store: two nodes can then own one cell. A store can also accept the
 conditional headers and ignore the condition, and that store fails late
-and silently — so run the storage test below.
+and silently, so run the storage test below.
 
 MinIO (the community edition) implements the conditional writes and
 passes the storage test, but celld has not qualified it for production.
@@ -124,9 +123,9 @@ the write durable and confirms that it still owns the cell.
 
 Each cell has one ownership record in the bucket. The record names the
 owner node's session and carries a fencing epoch. A node acquires a
-cell with a conditional write — a create when no record exists, a
-compare-and-swap on the previous record when one does — and the bucket
-accepts one such write, so two nodes cannot acquire the same cell.
+cell with a conditional create when no record exists, or a compare-and-swap
+on an existing record. The bucket accepts only one competing write, so two
+nodes cannot acquire the same cell.
 
 Every activation advances the epoch, a takeover and a local wake alike.
 Each owner therefore replicates under a fresh epoch, and an epoch never
@@ -141,6 +140,12 @@ but its writes land in a superseded prefix, and a restore selects the
 current lineage. (The tiering path can first combine segments from many
 cells into a node bundle, and it drains each segment into its per-cell
 prefix later.)
+
+The compactor reads retained bundles when a cell's segments leave the
+in-memory index. A failed compaction retries after 30 seconds, and repeated
+failures increase the delay to a maximum of 300 seconds. The bundle collector
+advances through retained objects and deletes a bundle only when the per-cell
+prefixes cover every segment in that bundle.
 
 The prefix protects the new owner's data from stale writes. The next
 two sections protect the durability promise.

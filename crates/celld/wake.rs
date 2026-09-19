@@ -282,38 +282,52 @@ async fn run_due_scans(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct WakerRoleLease {
+    node: String,
+    expires_ms: i64,
+}
+
+async fn same_node_still_holds_waker(bucket: &Bucket, node: &str) -> bool {
+    let Ok(Some((bytes, _))) = bucket.get("wake/waker.json").await else {
+        return false;
+    };
+    let Ok(lease) = serde_json::from_slice::<WakerRoleLease>(&bytes) else {
+        return false;
+    };
+    lease.node == node && lease.expires_ms > crate::asyncrt::wall_ms()
+}
+
 /// Advisory waker-role lease: one holder per fleet to avoid N nodes polling.
 /// Correctness never depends on it — concurrent wakers race activation CAS
-/// harmlessly — so every failure path just returns false and skips a tick.
+/// harmlessly — so a caller skips the tick when another node holds the role.
 pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i64) -> bool {
     const KEY: &str = "wake/waker.json";
     let body =
         |expires: i64| format!("{{\"node\":{node:?},\"expires_ms\":{expires}}}").into_bytes();
-    match bucket.get(KEY).await {
+    let token = match bucket.get(KEY).await {
         // absent (or unreadable): claim if absent
-        Ok(None) | Err(_) => matches!(
-            bucket.put_cas(KEY, body(now_ms + ttl_ms), None).await,
-            Ok(Some(_))
-        ),
+        Ok(None) | Err(_) => None,
         Ok(Some((bytes, etag))) => {
-            let text = String::from_utf8_lossy(&bytes);
-            let held_by_us = text.contains(&format!("\"node\":{node:?}"));
-            let expires = text
-                .rsplit("\"expires_ms\":")
-                .next()
-                .and_then(|t| t.trim_end_matches('}').trim().parse::<i64>().ok())
-                .unwrap_or(0);
-            if celld_logic::wake::waker_may_claim(held_by_us, expires, now_ms) {
-                matches!(
-                    bucket
-                        .put_cas(KEY, body(now_ms + ttl_ms), Some(&etag))
-                        .await,
-                    Ok(Some(_))
-                )
-            } else {
-                false
+            let lease = serde_json::from_slice::<WakerRoleLease>(&bytes).ok();
+            let held_by_us = lease.as_ref().is_some_and(|lease| lease.node == node);
+            let expires = lease.map_or(0, |lease| lease.expires_ms);
+            if !celld_logic::wake::waker_may_claim(held_by_us, expires, now_ms) {
+                return false;
             }
+            Some(etag)
         }
+    };
+    match bucket
+        .put_cas(KEY, body(now_ms + ttl_ms), token.as_deref())
+        .await
+    {
+        Ok(Some(_)) => true,
+        // The cleanup loop and the due-scan loop renew the same node's role.
+        // A clean CAS conflict can be their overlap, so check the winner
+        // before cancelling a GC pass and repeating its fleet-wide LIST.
+        Ok(None) => same_node_still_holds_waker(bucket, node).await,
+        Err(_) => false,
     }
 }
 

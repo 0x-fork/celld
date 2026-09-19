@@ -2892,6 +2892,9 @@ async fn handle_internal(
 ) -> Result<HttpReply, Infallible> {
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
+    let do_scope = path.strip_prefix("/do/");
+    let cell_scope = path.strip_prefix("/cell/");
+    let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
@@ -3017,9 +3020,10 @@ async fn handle_internal(
             )
             .await
         }
-        _ if path.starts_with("/do/") && app.runtime.is_some() => {
+        _ if do_scope.is_some() && app.runtime.is_some() => {
             let runtime = app.runtime.as_ref().expect("checked runtime");
-            let cell = match runtime.cell_scope(&path[4..]) {
+            let scope = do_scope.expect("checked prefix");
+            let cell = match runtime.cell_scope(scope) {
                 Ok(cell) => cell,
                 Err(error) => {
                     return Ok(response(StatusCode::BAD_REQUEST, format!("{error:#}")));
@@ -3058,12 +3062,13 @@ async fn handle_internal(
             };
             dispatch_cell_fetch(cell, None, url, method, body, headers).await
         }
-        _ if path.starts_with("/cell/") && !celld_logic::cell::valid_cell_scope(&path[6..]) => {
-            malformed_scope()
-        }
-        _ if path.starts_with("/cell/") => {
-            let cell = path[6..].to_string();
-            match app.request(cell.clone()).await {
+        _ if cell_scope.is_some() => {
+            let cell = cell_scope.expect("checked prefix");
+            if !celld_logic::cell::valid_cell_scope(cell) {
+                malformed_scope()
+            } else {
+                let cell = cell.to_string();
+                match app.request(cell.clone()).await {
                 Ok(Routed {
                     request,
                     route: Route::Local,
@@ -3089,18 +3094,20 @@ async fn handle_internal(
                         "{{\"route\":\"remote\",\"node\":{node:?},\"addr\":{addr:?},\"epoch\":{epoch},\"peer_protocol\":{peer_protocol}}}"
                     ),
                 ),
-                Err(error) => response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("{{\"error\":\"{error:?}\"}}"),
-                ),
+                    Err(error) => response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("{{\"error\":\"{error:?}\"}}"),
+                    ),
+                }
             }
         }
-        _ if path.starts_with("/evict/") && !celld_logic::cell::valid_cell_scope(&path[7..]) => {
-            malformed_scope()
-        }
-        _ if path.starts_with("/evict/") => {
-            app.evict(path[7..].to_string()).await;
-            response(StatusCode::OK, "{\"ok\":true}")
+        _ if evict_scope.is_some() => {
+            let cell = evict_scope.expect("checked prefix");
+            if !celld_logic::cell::valid_cell_scope(cell) {
+                malformed_scope()
+            } else {
+                eviction_response(app.evict(cell.to_string()).await)
+            }
         }
         _ => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
     };
@@ -3120,6 +3127,26 @@ async fn handle_internal(
         );
     }
     Ok(result)
+}
+
+fn eviction_response(result: Result<EvictSuccess, EvictError>) -> HttpReply {
+    let Err(error) = result else {
+        return response(StatusCode::OK, r#"{"ok":true}"#);
+    };
+    let status = match error {
+        EvictError::Refused(EvictRefusal::NodeUnavailable | EvictRefusal::ConcurrencyLimit)
+        | EvictError::Failed(EvictFailure::ActorUnavailable) => StatusCode::SERVICE_UNAVAILABLE,
+        EvictError::Refused(_) | EvictError::Cancelled(_) => StatusCode::CONFLICT,
+        EvictError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    response(
+        status,
+        serde_json::json!({
+            "ok": false,
+            "error": { "kind": error.kind(), "reason": error.reason() }
+        })
+        .to_string(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3505,8 +3532,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .init();
     // After the subscriber, because this reports whether the allocator agreed
     // to return freed pages on a timer. A node without that thread holds
-    // retention until a thread allocates again, which is the condition behind
-    // issue #36, so the operator has to be able to read the answer.
+    // retention until a thread allocates again, so the operator has to be
+    // able to read whether that cleanup thread started.
     celld::memory::tune_allocator();
     let mut settings = match action {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
@@ -3515,6 +3542,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
         Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
         Action::Queue(arguments) => return celld::queue_cli::run(arguments).await,
+        Action::R2(arguments) => return celld::r2_cli::run(arguments).await,
         Action::Connect(arguments) => {
             return celld::control_plane::handle_connect_command(arguments).await
         }
@@ -4356,6 +4384,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             tick.set_missed_tick_behavior(celld::asyncrt::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
+                // What SQLite freed when a cell stopped stays on the C
+                // allocator's free lists, and the sample would count it as
+                // the node's: 5,000 hibernated cells kept RSS at 1.6 GB with
+                // 1.5 GB of it free (GCE, 2026-09-04). Trimmed here,
+                // ahead of the sample, on a blocking thread because a trim
+                // walks every free chunk.
+                let _ = tokio::task::spawn_blocking(celld::memory::trim_c_heap_if_retained).await;
                 if sample_tx.send(Message::SampleLoad).is_err() {
                     return;
                 }

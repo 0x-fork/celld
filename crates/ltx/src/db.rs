@@ -395,7 +395,7 @@ impl Db {
     }
 
     /// Opens both managed connections through a named SQLite VFS. Used by the
-    /// fault-injection VFS of the test suite and by paged restore's fault-in VFS.
+    /// fault-injection VFS in tests and by paged restore's fault-in VFS.
     pub fn open_with_host_and_vfs(
         path: impl AsRef<Path>,
         host: crate::LtxHost,
@@ -418,6 +418,16 @@ impl Db {
         };
         let conn = open(&path).map_err(sql_err)?;
         disable_lookaside(&conn)?;
+        // Cap the page cache at 64 KiB; SQLite's default (-2000) lets each
+        // connection grow to 2 MiB, and every resident cell owns this
+        // connection, so the default repeats a dead-weight cost at fleet
+        // density. The connection only runs PRAGMAs, the sealing write to
+        // the control tables, and checkpoints, and a checkpoint streams WAL
+        // frames into the database without revisiting pages, so a larger
+        // cache buys no reuse. 16 default-size pages still cover the
+        // control tables and their schema pages.
+        conn.pragma_update(None, "cache_size", -64)
+            .map_err(sql_err)?;
 
         // DSN pragmas: busy_timeout + wal_autocheckpoint(0) (db.go:818).
         // autocheckpoint MUST be 0 because litestream owns checkpointing.
@@ -446,6 +456,14 @@ impl Db {
         // Dedicated read-lock connection (mirrors a second pooled connection).
         let rtx_conn = open(&path).map_err(sql_err)?;
         disable_lookaside(&rtx_conn)?;
+        // This connection runs one tiny read to take the read lock and then
+        // idles for the whole residency, so SQLite's default page-cache limit
+        // (-2000 = up to 2 MiB) is dead weight repeated per resident cell.
+        // Cap it at a few pages; no user query or checkpoint runs here, so a
+        // smaller cache cannot slow either path.
+        rtx_conn
+            .pragma_update(None, "cache_size", -16)
+            .map_err(sql_err)?;
         rtx_conn
             .busy_timeout(Self::DEFAULT_BUSY_TIMEOUT)
             .map_err(sql_err)?;
@@ -2392,6 +2410,19 @@ pub mod internal {
     pub fn wal_autocheckpoint(db: &Db) -> Result<i64> {
         db.conn
             .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .map_err(sql_err)
+    }
+
+    /// The effective `PRAGMA cache_size` of the writer connection.
+    pub fn writer_cache_size(db: &Db) -> Result<i64> {
+        db.conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .map_err(sql_err)
+    }
+
+    pub fn read_lock_connection_cache_size(db: &Db) -> Result<i64> {
+        db.rtx_conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .map_err(sql_err)
     }
 

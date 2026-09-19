@@ -456,6 +456,34 @@ impl Drop for Residency {
 
 type Build = Box<dyn Fn() -> Result<js::Worker> + Send + Sync>;
 
+/// One pool's isolates by state, as `/state` reports them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PoolCensus {
+    /// Isolates that accept placement and work.
+    pub live: usize,
+    /// Live isolates that house no cell. The next maintenance pass retires
+    /// them, so a count that persists across passes means the pass is not
+    /// running.
+    pub live_empty: usize,
+    /// Retiring isolates whose heap is still installed, because a turn, a
+    /// request, or a cell holds it.
+    pub retiring: usize,
+    /// Slots whose heap has been freed.
+    pub freed: usize,
+    /// Cells housed across the pool.
+    pub cells: usize,
+    /// Request affiliations across the pool, running or suspended.
+    pub requests: usize,
+    /// Turns in flight across the pool.
+    pub turns: usize,
+    /// Physical memory V8 has committed to the heaps of the isolates a turn
+    /// did not hold at the sample.
+    pub heap_bytes: u64,
+    /// External memory those isolates track: array buffer stores and the
+    /// like, which live outside the V8 heap.
+    pub external_bytes: u64,
+}
+
 pub struct Pool {
     slots: RwLock<Vec<Arc<Slot>>>,
     limits: PoolLimits,
@@ -681,6 +709,10 @@ impl Pool {
     /// an empty cell heap carries no warm request capacity worth preserving.
     pub fn reap_empty(&self) {
         let Ok(_maintenance) = self.maintenance.try_write() else {
+            tracing::debug!(
+                event = "isolate_reap_skipped",
+                "a cell start holds the pool; empty isolates wait for the next pass"
+            );
             return;
         };
         while self.retire_one() {}
@@ -751,6 +783,51 @@ impl Pool {
             .iter()
             .filter(|slot| !slot.is_retiring())
             .count()
+    }
+
+    /// What the pool holds right now, for `/state`.
+    ///
+    /// The count an operator of a hibernation-heavy node needs and could
+    /// not get: a dormant cell keeps about 160 KB more than its own records
+    /// explain (GCE, 2026-09-03), and the one O(cells) structure
+    /// that fits is the isolate. `live_empty` is what `reap_empty` retires
+    /// on its next pass and `retiring` is what `may_free` still refuses, so
+    /// either staying positive across passes names the leak.
+    pub fn census(&self) -> PoolCensus {
+        let mut census = PoolCensus::default();
+        for slot in self.slots.read().expect("pool poisoned").iter() {
+            let load = slot.observe();
+            census.cells += load.cells;
+            census.requests += load.requests;
+            census.turns += load.turns;
+            // A heap is gone once its worker was taken. A worker a turn
+            // holds right now is installed, so a failed `try_lock` counts
+            // as a heap and never as freed; its size is unknown this pass.
+            // Holding the guard is the permit a turn holds, which is what
+            // makes the V8 lock inside `heap_bytes` uncontended.
+            match slot.worker.try_lock() {
+                Ok(worker) if worker.is_none() => {
+                    census.freed += 1;
+                    continue;
+                }
+                Ok(worker) => {
+                    if let Some(heap) = worker.as_ref().and_then(js::Worker::heap_bytes) {
+                        census.heap_bytes += heap.physical;
+                        census.external_bytes += heap.external;
+                    }
+                }
+                Err(_) => {}
+            }
+            if load.retiring {
+                census.retiring += 1;
+            } else {
+                census.live += 1;
+                if load.cells == 0 {
+                    census.live_empty += 1;
+                }
+            }
+        }
+        census
     }
 }
 

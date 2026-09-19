@@ -547,11 +547,11 @@ const __fmt = (a) => a.map((x) => {
 }).join(" ");
 const __consoleNoop = () => {};
 globalThis.console = {
-  debug: (...a) => __log(__fmt(a)),
-  error: (...a) => __log("ERROR " + __fmt(a)),
-  info: (...a) => __log(__fmt(a)),
-  log: (...a) => __log(__fmt(a)),
-  warn: (...a) => __log("WARN " + __fmt(a)),
+  debug: (...a) => __log("debug", __fmt(a)),
+  error: (...a) => __log("error", __fmt(a)),
+  info: (...a) => __log("info", __fmt(a)),
+  log: (...a) => __log("log", __fmt(a)),
+  warn: (...a) => __log("warn", __fmt(a)),
   clear: __consoleNoop,
   count: __consoleNoop,
   group: __consoleNoop,
@@ -3119,22 +3119,17 @@ __celld.__makeLoader = () => {
   // `get(name, ...)` is memoized by name to one isolate; `load()` is anonymous.
   // A stub holds a Promise<id> so `getCode` may be async and load lazily.
   const byName = new Map();
-  // getEntrypoint() and getDurableObjectClass() take the same options bag, so
-  // one function reads it and returns the only option celld implements.
-  // Workerd ignores an option it does not know; celld refuses it, because a
-  // silently dropped option is exactly the defect getEntrypoint() had. Keeping
-  // the rule here rather than in each method is what stops the two from
-  // drifting apart again.
-  const loaderProps = (method, options) => {
+  const loaderOptions = (method, options, supportsLimits) => {
     if (options === null || options === undefined) return undefined;
     if (typeof options !== "object")
       throw new TypeError(method + "() options must be an object.");
-    const extra = Object.keys(options).filter((key) => key !== "props");
+    const extra = Object.keys(options).filter(
+      (key) => key !== "props" && !(supportsLimits && key === "limits"));
     if (extra.length !== 0)
       throw new TypeError(
         method + '() does not support the option "' + extra.join('", "') +
-        '". celld supports only "props".');
-    return options.props;
+        '".');
+    return options;
   };
   // `props` cross to the loaded isolate by structured clone, on the same
   // transport that already carries the call's arguments (`__rpcOut` below).
@@ -3145,27 +3140,54 @@ __celld.__makeLoader = () => {
   // loader API call, also rejects an unclonable value at that call rather than
   // at the first operation.
   const loaderPropsSc = (method, options) => {
-    const props = loaderProps(method, options);
+    const props = loaderOptions(method, options, false)?.props;
     if (props === undefined) return undefined;
     // `lift` false: the props cross an isolate boundary, so a stub inside them
     // is a DataCloneError, exactly as a stub inside an argument of the same
     // call is.
     return __rpcOut(props, false);
   };
-  const makeEntrypoint = (idPromise, entrypoint, propsSc) => {
+  const loaderEntrypointOptions = (options) => {
+    options = loaderOptions("getEntrypoint", options, true);
+    const props = options?.props;
+    return {
+      propsSc: props === undefined ? undefined : __rpcOut(props, false),
+      limitsJson: JSON.stringify(options?.limits ?? null),
+    };
+  };
+  const makeEntrypoint = (loadPromise, entrypoint, propsSc, limitsJson) => {
     const target = {
       async fetch(input, init) {
-        const id = await idPromise;
+        const { id, tails } = await loadPromise;
         const req = new Request(input, init);
         // The verbatim header list; see the note on the outbound `fetch`.
         // The loaded worker rebuilds a `Headers` from these pairs, so a
         // repeat and its casing survive the isolate boundary.
         const headers = JSON.stringify(req.headers.__celldHeaderList);
         const { body, streamId } = await __subrequestBody(req);
-        const r = JSON.parse(
-          await __loader_fetch(
-            id, req.url, req.method, body, headers, streamId, entrypoint,
-            propsSc === undefined ? new Uint8Array() : propsSc));
+        const loaded = __loader_fetch(
+          id, req.url, req.method, body, headers, streamId, entrypoint,
+          propsSc === undefined ? new Uint8Array() : propsSc,
+          limitsJson, tails.length !== 0);
+        const response = tails.length === 0 ? loaded : loaded[0];
+        if (tails.length !== 0) {
+          const delivery = loaded[1]
+            .then((report) => JSON.parse(report))
+            .then((events) => Promise.allSettled(
+              tails.map((tail) => tail.tail(events))))
+            .then((results) => {
+              for (const result of results) {
+                if (result.status === "rejected")
+                  console.error("Tail Worker failed:", result.reason);
+              }
+            })
+            .catch((error) => console.error("Tail delivery failed:", error));
+          // The loaded fetch answers before its report because the child can
+          // still have waitUntil work. Keep this chain on the loader event so
+          // its IoContext cannot retire and abort the report operation.
+          __registerWaitUntil(delivery);
+        }
+        const r = JSON.parse(await response);
         const responseBody = r.streamId !== undefined
           ? new CelldHttpBodyStream(r.streamId)
           : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
@@ -3187,10 +3209,10 @@ __celld.__makeLoader = () => {
           throw new Error(
             "Pipelined property paths on loaded workers are not supported " +
             "yet.");
-        const id = await idPromise;
+        const { id } = await loadPromise;
         return __rpcDes(
           await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false),
-            propsSc));
+            propsSc, limitsJson));
       })(),
     };
     return new Proxy(target, {
@@ -3208,26 +3230,30 @@ __celld.__makeLoader = () => {
   const finalizer = typeof FinalizationRegistry === "function"
     ? new FinalizationRegistry((id) => __loader_drop(id))
     : null;
-  const makeStub = (idPromise, evictable) => {
+  const makeStub = (loadPromise, evictable) => {
     // Explicit disposal evicts the worker deterministically; the finalizer is
     // a GC backstop for anonymous stubs that are dropped without disposing.
     // __loader_drop is idempotent, so the two paths cannot double-free.
-    const drop = () => { idPromise.then((id) => __loader_drop(id), () => {}); };
+    const drop = () => {
+      loadPromise.then(({ id }) => __loader_drop(id), () => {});
+    };
     const stub = {
       getEntrypoint(name = null, options = {}) {
+        const { propsSc, limitsJson } = loaderEntrypointOptions(options);
         return makeEntrypoint(
-          idPromise, name === null ? "default" : String(name),
-          loaderPropsSc("getEntrypoint", options));
+          loadPromise, name === null ? "default" : String(name),
+          propsSc, limitsJson);
       },
       getDurableObjectClass(name = null, options = {}) {
         return __makeDurableObjectClass(
-          idPromise, name, loaderPropsSc("getDurableObjectClass", options));
+          loadPromise.then(({ id }) => id), name,
+          loaderPropsSc("getDurableObjectClass", options));
       },
       dispose: drop,
     };
     if (typeof Symbol.dispose === "symbol") stub[Symbol.dispose] = drop;
     if (evictable && finalizer)
-      idPromise.then((id) => finalizer.register(stub, id), () => {});
+      loadPromise.then(({ id }) => finalizer.register(stub, id), () => {});
     return stub;
   };
   // JSON.stringify silently drops binary values, so each non-string module --
@@ -3298,7 +3324,7 @@ __celld.__makeLoader = () => {
   const encodeModules = (c) => {
     if (c === null || typeof c !== "object" || c.modules === null
         || typeof c.modules !== "object")
-      return { config: c, wasm: [], outbound: undefined };
+      return { config: c, wasm: [], outbound: undefined, tails: [] };
     const modules = {};
     const wasm = [];
     for (const [name, value] of Object.entries(c.modules)) {
@@ -3349,14 +3375,25 @@ __celld.__makeLoader = () => {
       }
     }
     const { env, envRoutes } = encodeLoaderEnv(c.env);
+    let tails = [];
+    if (Object.prototype.hasOwnProperty.call(c, "tails")) {
+      if (!Array.isArray(c.tails))
+        throw new TypeError("tails must be an array of Fetchers.");
+      tails = c.tails.map((tail) => {
+        if (!__outboundMeta.has(tail))
+          throw new TypeError("tails must be an array of Fetchers.");
+        return tail;
+      });
+    }
     const {
       globalOutbound: _globalOutbound,
       env: _env,
+      tails: _tails,
       ...rest
     } = c;
     return {
       config: { ...rest, modules }, wasm, outbound, outboundProps,
-      env, envRoutes,
+      env, envRoutes, tails,
     };
   };
   // getCode is deferred into a microtask so a throw (or async getCode)
@@ -3365,11 +3402,12 @@ __celld.__makeLoader = () => {
     Promise.resolve().then(getCode)
       .then((c) => {
         const {
-          config, wasm, outbound, outboundProps, env, envRoutes,
+          config, wasm, outbound, outboundProps, env, envRoutes, tails,
         } = encodeModules(c);
-        return __loader_load(
+        const id = __loader_load(
           JSON.stringify(config), wasm, outbound, outboundProps, env,
-          envRoutes);
+          envRoutes, tails.length !== 0);
+        return { id, tails };
       });
   return {
     load(code) { return makeStub(loadFrom(() => code), true); },
@@ -6749,8 +6787,53 @@ const __kvEncodeValue = (value) => {
     };
   }
   throw __kvError(
-    "a KV value must be a string, an ArrayBuffer, or a typed array",
+    "a KV value must be a string, an ArrayBuffer, a typed array, or a ReadableStream",
   );
+};
+
+// Upstream accepts a ReadableStream, and `put(key, request.body)` is how a
+// handler stores a request body, so refusing one broke the obvious spelling.
+// The stream must become bytes before the cell write: a cell replicates a
+// value as LTX, and a pending stream has no bytes to replicate.
+//
+// The bound is enforced while draining rather than on the finished buffer.
+// Checking afterwards would let a body larger than the limit reach memory in
+// full before the refusal, which hands an unbounded allocation to whoever
+// sends the request.
+const __kvDrainStream = async (stream) => {
+  const limit = __kvLimits().maxValueBytes;
+  const reader = stream.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = ArrayBuffer.isView(value)
+        ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+        : new Uint8Array(value);
+      size += chunk.byteLength;
+      if (size > limit) {
+        throw __kvError(`a value is at most ${limit} bytes, and the stream is larger`);
+      }
+      chunks.push(chunk);
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  // The chunk wrappers can alias the buffers yielded by the stream. `set()`
+  // copies their current bytes into one owned result, so later mutation of a
+  // yielded buffer cannot change the stored value.
+  const value = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    value.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return value;
 };
 
 const __kvDecodeValue = (bytes, tag, type) => {
@@ -6843,8 +6926,13 @@ class KvNamespace {
   async put(key, value, options) {
     const name = String(key);
     __kvCheckKey(name);
-    const encoded = __kvEncodeValue(value);
-    __kvCheckValue(encoded.value.byteLength);
+    let encoded;
+    if (typeof ReadableStream !== "undefined" && value instanceof ReadableStream) {
+      encoded = { value: await __kvDrainStream(value), tag: __KV_TAG_BYTES };
+    } else {
+      encoded = __kvEncodeValue(value);
+      __kvCheckValue(encoded.value.byteLength);
+    }
     const metadata = options && options.metadata !== undefined
       ? JSON.stringify(options.metadata)
       : null;
@@ -10439,10 +10527,10 @@ const __cf = __celld.__cf = {
   RpcProperty: class RpcProperty {},
   ServiceStub: class ServiceStub {},
   // `import { waitUntil } from "cloudflare:workers"`: register into
-  // the current event; outside any event this is Workerd's
-  // global-scope error.
+  // the current event or extend its active background work. Outside either
+  // lifetime this is Workerd's global-scope error.
   waitUntil(promise) {
-    if (__event_depth() === 0)
+    if (!__wait_until_active())
       throw new Error(
         "Disallowed operation called within global scope.");
     __registerWaitUntil(promise);
@@ -11804,14 +11892,42 @@ __celld.__zlibModule = {
   deflateRawSync: (data, _options) => __zlibSync("deflateRaw", data),
   inflateRawSync: (data, _options) => __zlibSync("inflateRaw", data),
 };
+// A Node dependency reads a `process` field at module scope and passes it
+// straight to something that rejects `undefined` -- `dirname(process.execPath)`
+// is one such case. Workerd defines every field
+// below with a neutral value, so the same bundle evaluates there. A missing
+// field therefore fails the whole Worker at load, which is why each one is
+// defined even though nothing in a cell has an executable path, a parent
+// process, or a real exit code. The values match workerd's
+// `src/node/internal/public_process.ts` at workerd revision 04a08513a419
+// (2026-09-04); celld does not invent its own, because a dependency that reads
+// them is comparing them to what workerd reports. A field whose workerd
+// implementation throws at that revision -- `kill`, `binding`, `dlopen`,
+// `cpuUsage` -- stays absent, because it fails on both runtimes and a stub
+// here would only change the message.
 if (!globalThis.process) globalThis.process = {
   env: {}, platform: "linux", arch: "x64", version: "v20.0.0",
-  versions: { node: "20.0.0" }, argv: [], cwd: () => "/",
+  versions: { node: "20.0.0" }, cwd: () => "/",
+  title: "workerd", argv: ["workerd"], argv0: "workerd", execArgv: [],
+  execPath: "", pid: 1, ppid: 0, exitCode: undefined,
+  allowedNodeEnvironmentFlags: new Set(),
+  release: { name: "node", lts: true, sourceUrl: "", headersUrl: "" },
+  channel: null, connected: false, debugPort: 0, domain: null,
+  noDeprecation: false, traceDeprecation: false, throwDeprecation: false,
+  sourceMapsEnabled: false, moduleLoadList: [],
   stdin: { fd: 0, isTTY: false },
   stdout: { fd: 1, isTTY: false, write: (s) => { __log(String(s)); return true; } },
   stderr: { fd: 2, isTTY: false, write: (s) => { __log(String(s)); return true; } },
   nextTick: (f, ...a) => queueMicrotask(() => f(...a)),
   on() {}, once() {}, off() {}, emit() {}, hrtime: () => [0, 0],
+  // Workerd routes a warning to the process 'warning' event, and this
+  // process emits nothing, so a no-op keeps the two runtimes equivalent.
+  emitWarning() {},
+  ref() {}, unref() {}, uptime: () => 0,
+  constrainedMemory: () => 0, availableMemory: () => 0,
+  memoryUsage: () => ({
+    rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0,
+  }),
 };
 globalThis.process.exit = (code = 0) => {
   const actorScope = __currentActorScope();
@@ -12156,6 +12272,17 @@ const __fsNamespaceProxy = (surface, path, names, enoentNames = []) => {
       return __nodeStubFor(path + "." + p);
     },
     ownKeys: () => [...namespaceNames],
+    // A lazy name has no descriptor on the target, so the synthetic one below
+    // completes to `writable: false`. Without this trap an assignment would
+    // reach OrdinarySet, read that descriptor off the proxy as the receiver,
+    // and throw "Cannot redefine property". CommonJS dependencies patch a
+    // builtin at module scope, so the throw takes the whole Worker down at
+    // load. Write through to the surface instead, which also promotes the name
+    // to a real own property and keeps the descriptor honest from then on.
+    // Materializing a complete descriptor in the trap below would fix the
+    // assignment too, but it would charge every Worker for all the stubs the
+    // moment anything enumerates the namespace.
+    set: (target, p, value) => Reflect.set(target, p, value),
     getOwnPropertyDescriptor: (target, p) =>
       Reflect.getOwnPropertyDescriptor(target, p) ??
         (namespaceNames.has(p)

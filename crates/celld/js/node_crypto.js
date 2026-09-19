@@ -629,19 +629,43 @@
     }
   };
   const asymmetricMaterial = (key) => key.__celldMaterial ?? {};
-  // Node names the Web Crypto algorithm, not the key type, on the CryptoKey.
-  // Node accepts several spellings of the same curve; celld generates P-256
-  // only, so the table doubles as the supported-curve check.
-  const EC_CURVE_ALIASES = {
-    "prime256v1": "P-256",
-    "secp256r1": "P-256",
-    "P-256": "P-256",
-  };
+  // The generation op does not carry a curve yet, so it always generates
+  // P-256. Keep that limitation separate from imported-key conversion, which
+  // accepts every curve that the shared Web Crypto implementation parses.
+  const GENERATED_EC_CURVES = new Set([
+    "prime256v1", "secp256r1", "P-256",
+  ]);
   const WEB_CRYPTO_ALGORITHM = {
     rsa: "RSASSA-PKCS1-v1_5",
     ec: "ECDSA",
     ed25519: "Ed25519",
     x25519: "X25519",
+  };
+  // Keep each algorithm's key type and legal usages together. A converted
+  // key that carries only one of these values can pass a library's surface
+  // checks and then authorize the wrong Web Crypto operation.
+  const WEB_CRYPTO_KEY_CONTRACT = {
+    "RSASSA-PKCS1-V1_5": {
+      keyType: "rsa", private: ["sign"], public: ["verify"],
+    },
+    "RSA-PSS": { keyType: "rsa", private: ["sign"], public: ["verify"] },
+    "RSA-OAEP": {
+      keyType: "rsa",
+      private: ["decrypt", "unwrapKey"],
+      public: ["encrypt", "wrapKey"],
+    },
+    "ECDSA": { keyType: "ec", private: ["sign"], public: ["verify"] },
+    "ECDH": {
+      keyType: "ec", private: ["deriveKey", "deriveBits"], public: [],
+    },
+    "ED25519": {
+      keyType: "ed25519", private: ["sign"], public: ["verify"],
+    },
+    "X25519": {
+      keyType: "x25519",
+      private: ["deriveKey", "deriveBits"],
+      public: [],
+    },
   };
 
   function asymmetricKeyObject(result, visibility) {
@@ -673,11 +697,47 @@
     get asymmetricKeyType() {
       return asymmetricMaterial(this[kHandle]).keyType;
     }
-    // The handle already *is* a CryptoKey; Node's contract is only that the
-    // result is usable with Web Crypto, and this key was built with the
-    // algorithm Web Crypto expects.
-    toCryptoKey() {
-      return this[kHandle];
+    toCryptoKey(algorithm, extractable, usages) {
+      const material = asymmetricMaterial(this[kHandle]);
+      const requestedName = typeof algorithm === "string"
+        ? algorithm
+        : algorithm?.name;
+      const contract = WEB_CRYPTO_KEY_CONTRACT[
+        String(requestedName ?? "").toUpperCase()
+      ];
+      if (contract?.keyType !== material.keyType) {
+        throw new DOMException("Invalid key type", "DataError");
+      }
+      if (material.keyType === "ec" && typeof algorithm === "object" &&
+          algorithm?.namedCurve !== undefined) {
+        const requestedCurve = __celld.$$canonicalEcCurve(
+          algorithm.namedCurve);
+        const keyCurve = __celld.$$canonicalEcCurve(
+          material.details?.namedCurve);
+        if (requestedCurve === undefined || requestedCurve !== keyCurve) {
+          throw new DOMException("Named curve mismatch", "DataError");
+        }
+      }
+
+      // `toCryptoKey()` is synchronous, so it cannot call subtle.importKey().
+      // Build a new view over the normalized material instead. Returning the
+      // KeyObject's storage handle loses all three requested values and makes
+      // libraries such as jose reject a valid private key before signing.
+      const requestedUsages = Array.from(usages);
+      const allowedUsages = contract[this.type];
+      if (requestedUsages.some((usage) => !allowedUsages.includes(usage)) ||
+          (this.type === "private" && requestedUsages.length === 0)) {
+        throw new DOMException(
+          `Invalid ${this.type} key usages`, "SyntaxError");
+      }
+      return new CryptoKey(
+        this.type,
+        __celld.$$keyAlgorithm(
+          requestedName, algorithm, material.keyType, material.details),
+        extractable,
+        requestedUsages,
+        material,
+      );
     }
   }
   class PublicKeyObject extends AsymmetricKeyObject {
@@ -919,7 +979,7 @@
           `generateKeyPairSync rsa with publicExponent ${publicExponent}`);
       }
     }
-    if (type === "ec" && EC_CURVE_ALIASES[namedCurve] === undefined) {
+    if (type === "ec" && !GENERATED_EC_CURVES.has(namedCurve)) {
       throw ERR_METHOD_NOT_IMPLEMENTED(
         `generateKeyPairSync ec ${namedCurve}`);
     }

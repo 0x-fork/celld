@@ -300,6 +300,7 @@ const RECOVERY_GATHER_WINDOW_BYTES: u64 = 512 * 1024 * 1024;
 /// listing per cell at once.
 const COVERAGE_READ_CONCURRENCY: usize = 16;
 const BUNDLE_ROW_INDEX_CAPACITY: usize = 512;
+const BUNDLE_GC_EXAMINED_PER_TICK: usize = 512;
 
 struct IndexedBundle {
     cells: BTreeSet<String>,
@@ -311,6 +312,19 @@ struct BundleIndex {
     bundles: BTreeMap<String, IndexedBundle>,
     by_cell: BTreeMap<String, BTreeSet<String>>,
     recent: std::collections::VecDeque<String>,
+    /// The highest txid whose row metadata left `recent`, per cell epoch. A
+    /// cell needs its evicted bundles only until its per-cell coverage passes
+    /// this cut, so a covered cell costs no bundle read.
+    evicted: BTreeMap<(String, u64), u64>,
+}
+
+/// One cell epoch's view of the index. The rows, the evicted bundles, and
+/// their cut come from one lock: an eviction between two reads could drop a
+/// bundle from both the rows and the evicted set.
+struct CellBundleRows {
+    located: Vec<celld_ltx::LocatedRow>,
+    evicted: Vec<String>,
+    evicted_through: Option<u64>,
 }
 
 impl BundleIndex {
@@ -339,8 +353,13 @@ impl BundleIndex {
                 .recent
                 .pop_front()
                 .expect("an over-capacity bundle row index is not empty");
-            if let Some(bundle) = self.bundles.get_mut(&oldest) {
-                bundle.rows = None;
+            let rows = self
+                .bundles
+                .get_mut(&oldest)
+                .and_then(|bundle| bundle.rows.take());
+            for row in rows.into_iter().flatten() {
+                let through = self.evicted.entry((row.cell, row.cell_epoch)).or_default();
+                *through = (*through).max(row.txid);
             }
         }
     }
@@ -361,22 +380,30 @@ impl BundleIndex {
         })
     }
 
-    fn recent_rows_for(&self, cell: &str, epoch: u64) -> Vec<celld_ltx::LocatedRow> {
-        self.recent
-            .iter()
-            .filter_map(|key| self.bundles.get_key_value(key))
-            .flat_map(|(key, bundle)| {
-                bundle
-                    .rows
-                    .iter()
-                    .flatten()
-                    .filter(|row| row.cell == cell && row.cell_epoch == epoch)
-                    .map(|row| celld_ltx::LocatedRow {
-                        source: key.clone(),
-                        row: row.clone(),
-                    })
-            })
-            .collect()
+    fn cell_rows(&self, cell: &str, epoch: u64) -> CellBundleRows {
+        let mut located = Vec::new();
+        let mut evicted = Vec::new();
+        for key in self.by_cell.get(cell).into_iter().flatten() {
+            let Some(bundle) = self.bundles.get(key) else {
+                continue;
+            };
+            match &bundle.rows {
+                Some(rows) => located.extend(
+                    rows.iter()
+                        .filter(|row| row.cell == cell && row.cell_epoch == epoch)
+                        .map(|row| celld_ltx::LocatedRow {
+                            source: key.clone(),
+                            row: row.clone(),
+                        }),
+                ),
+                None => evicted.push(key.clone()),
+            }
+        }
+        CellBundleRows {
+            located,
+            evicted,
+            evicted_through: self.evicted.get(&(cell.to_string(), epoch)).copied(),
+        }
     }
 
     fn remove(&mut self, keys: &[String]) {
@@ -3502,6 +3529,9 @@ pub struct NodeLogManager {
     /// metadata stays bounded. A restart loses the index safely because it
     /// creates a new session and recovers the previous session as one unit.
     bundle_index: Mutex<BundleIndex>,
+    /// Resume after examined bundles, including those not yet covered.
+    /// Serialize passes so overlapping callers cannot move the cursor back.
+    bundle_gc_cursor: tokio::sync::Mutex<Option<String>>,
     /// Sessions whose bundle subtree one sweep pass confirmed empty:
     /// a permanent tombstone (dead-lease GC never deletes a folded
     /// record) must not cost a bundle LIST on every sweep tick forever
@@ -3547,7 +3577,7 @@ pub struct NodeLogManager {
     maintenance_publish_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
     #[cfg(all(test, celld_internal_tests))]
     shipper_injection_calls: std::sync::atomic::AtomicU64,
-    /// The gather window budget. The internal test cfg lowers it to fold a
+    /// The gather window budget. A test override lowers it to fold a
     /// small session in several windows.
     #[cfg(all(test, celld_internal_tests))]
     recovery_gather_window_bytes: std::sync::atomic::AtomicU64,
@@ -4010,6 +4040,7 @@ impl NodeLogManager {
             inner: Mutex::new(None),
             bundle_seq: std::sync::atomic::AtomicU64::new(0),
             bundle_index: Mutex::new(BundleIndex::default()),
+            bundle_gc_cursor: tokio::sync::Mutex::new(None),
             bundle_cache: tokio::sync::Mutex::new(None),
             health: Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default())),
             policy: Arc::new(policy),
@@ -5643,35 +5674,35 @@ impl NodeLogManager {
     }
 
     pub async fn gc_bundles(&self) -> anyhow::Result<()> {
-        // 512, not 32: the lab's profiling round found 1,300+ retained
-        // bundles — at ~1 bundle/s produced and 32 examined per 30 s tick
-        // the backlog only ever grew, and recovery's whole-prefix gather
-        // paid for it (89-112 s of a 97-116 s outage). The examined set
-        // costs one LIST plus mostly index-hits; the covered_txid cache
-        // bounds the per-tick LIST fan-out to the cell count. The TIME
-        // budget is the other half: un-indexed bundles cost a GET each,
-        // and an unbounded drain pass competed with serving hard enough
-        // to gray followers and trigger eviction churn (the ~300 ms
-        // bucket-riding window the faceted latency lanes exposed). The
-        // pass stops at the budget; the next tick continues where the
-        // listing puts it.
-        const EXAMINED_PER_TICK: usize = 512;
+        // Bound both the listing and the work. Restarting at the prefix
+        // every tick starved newer, covered bundles behind an undrained
+        // prefix forever. Advance after every examination, even a failed GET,
+        // and wrap only when the page reaches the end of the session.
         const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut cursor = self.bundle_gc_cursor.lock().await;
         let started = mono_ms();
         let prefix = format!("log/{}/bundle/", self.session);
+        let page = self
+            .bucket
+            .list_page(
+                &prefix,
+                cursor.as_deref(),
+                BUNDLE_GC_EXAMINED_PER_TICK,
+                None,
+            )
+            .await?;
         let mut covered: HashMap<(String, u64), u64> = HashMap::new();
         let mut deletable: Vec<(String, usize)> = Vec::new();
-        for meta in self
-            .bucket
-            .list(&prefix)
-            .await?
-            .into_iter()
-            .take(EXAMINED_PER_TICK)
-        {
-            if mono_ms().saturating_sub(started) > TICK_BUDGET.as_millis() as u64 {
+        let mut exhausted = true;
+        for (examined, meta) in page.objects.into_iter().enumerate() {
+            // Always examine one object so a slow listing cannot prevent
+            // progress. The budget can stop the remainder of the page.
+            if examined > 0 && mono_ms().saturating_sub(started) > TICK_BUDGET.as_millis() as u64 {
+                exhausted = false;
                 break;
             }
-            let key = meta.location.as_ref().to_string();
+            let key = meta.key;
+            *cursor = Some(key.clone());
             let indexed = {
                 let index = self.bundle_index.lock().unwrap();
                 index.rows(&key)
@@ -5700,11 +5731,19 @@ impl NodeLogManager {
                     }
                 };
                 paired.push((row.txid, watermark));
+                // One uncovered row retains the whole bundle. Do not pay
+                // for every other cell before reaching the same answer.
+                if !log_tier::bundle_deletable([(row.txid, watermark)]) {
+                    break;
+                }
             }
             if !log_tier::bundle_deletable(paired) {
                 continue;
             }
             deletable.push((key, rows.len()));
+        }
+        if exhausted && !page.truncated {
+            *cursor = None;
         }
         if deletable.is_empty() {
             return Ok(());
@@ -6089,11 +6128,55 @@ impl NodeLogManager {
         !self.closing.load(Ordering::SeqCst) && self.inner.lock().unwrap().is_some()
     }
 
-    pub(crate) fn rows_for(&self, cell: &str, epoch: u64) -> Vec<celld_ltx::LocatedRow> {
-        self.bundle_index
-            .lock()
-            .unwrap()
-            .recent_rows_for(cell, epoch)
+    /// One cell epoch's retained bundle rows, for the compaction overlay.
+    /// A slow cell can outlive the bounded row index, so a row that left the
+    /// index is read from the persisted bundles that the membership names.
+    pub(crate) async fn rows_for(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Vec<celld_ltx::LocatedRow>> {
+        let CellBundleRows {
+            mut located,
+            evicted,
+            evicted_through,
+        } = self.bundle_index.lock().unwrap().cell_rows(cell, epoch);
+        let covered = self.ltx.covered_txid(cell, epoch).await;
+        if evicted_through.is_some_and(|through| covered < through) {
+            // A cache is not the source of truth. A slow cell can lose its
+            // first row long before it reaches the compaction threshold.
+            // Fetch only the evicted bundles that contain the cell, with
+            // bounded concurrency. A failed read must fail the compaction;
+            // treating it as no rows would hide a gap or report false
+            // completion.
+            let fetches = evicted.into_iter().map(|key| async move {
+                let rows = match self.bucket.get(&key).await? {
+                    Some((bytes, _)) => celld_ltx::bundle::decode_rows(&bytes)?,
+                    // GC removes only rows covered by the per-cell layout.
+                    // A concurrent deletion is safe to omit.
+                    None => Vec::new(),
+                };
+                anyhow::Ok((key, rows))
+            });
+            let mut fetches =
+                futures_util::stream::iter(fetches).buffer_unordered(COVERAGE_READ_CONCURRENCY);
+            while let Some(fetched) = fetches.next().await {
+                let (key, rows) = fetched?;
+                located.extend(
+                    rows.into_iter()
+                        .filter(|row| row.cell == cell && row.cell_epoch == epoch)
+                        .map(|row| celld_ltx::LocatedRow {
+                            source: key.clone(),
+                            row,
+                        }),
+                );
+            }
+        }
+        // A folded L0 can cover several rows still in the index. The
+        // overlay deduplicates file starts, not interior transactions;
+        // returning those rows merges the same transaction twice.
+        located.retain(|located| located.row.txid > covered);
+        Ok(located)
     }
 
     pub(crate) async fn fetch_bundle(&self, source: &str) -> anyhow::Result<Vec<u8>> {

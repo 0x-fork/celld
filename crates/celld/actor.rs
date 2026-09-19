@@ -13,9 +13,10 @@ use crate::peer_auth::{self, PeerAuth};
 use crate::runtime::{CellHost, RuntimeManager};
 use anyhow::Context as _;
 use celld_logic::{
-    on_event, AdoptedCell, CapacityPeer, CasGuard, CasOutcome, Channel, Config, Effect, Event,
-    Failure, LeaseCasOutcome, NodeLeaseRecord, NodeLeaseSpec, OpId, OwnerRecord, OwnershipOnEvict,
-    Phase, RequestError, Route, State, StopCause, Timer, WebSocketKind, WorkerRoute,
+    on_event, AdoptedCell, CapacityPeer, CasGuard, CasOutcome, CellId, Channel, Config, Effect,
+    Event, EvictionAdmission, Failure, LeaseCasOutcome, NodeLeaseRecord, NodeLeaseSpec, OpId,
+    OwnerRecord, OwnershipOnEvict, Phase, RequestError, Route, State, StopCause, Timer,
+    WebSocketKind, WorkerRoute,
 };
 use futures_util::stream::FuturesUnordered;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -28,7 +29,10 @@ use tokio_util::time::{delay_queue, DelayQueue};
 
 mod local_request;
 mod production;
+pub use celld_logic::{EvictCancellation, EvictError, EvictFailure, EvictRefusal, EvictSuccess};
 pub use local_request::{LocalRequest, LocalRequestCompletion, LocalRequestFailure};
+
+type EvictionReply = oneshot::Sender<Result<EvictSuccess, EvictError>>;
 
 const DEFAULT_OPERATION_DEADLINE_MS: u64 = 15_000;
 /// How long a graceful handoff keeps refreshing an uncovered alarm's wake
@@ -477,7 +481,7 @@ pub enum Message {
     },
     Evict {
         cell: String,
-        reply: oneshot::Sender<()>,
+        reply: EvictionReply,
     },
     InvalidateRemote {
         cell: String,
@@ -1100,9 +1104,10 @@ impl CellRouteTiming {
 /// realm may still have. Both stop paths therefore retry rather than report,
 /// and they share this loop so neither can drift into reporting first.
 ///
-/// The retry is unbounded on purpose. The core arms an operation deadline on
-/// the `Cleaning` phase this answers, so a host that never lets go is bounded
-/// there rather than by a count guessed here.
+/// A bounded eviction checks its retry deadline after a release returns an
+/// error. Neither this await nor the core's `Cleaning` phase has an overall
+/// timeout. A pending release must not trigger a restart against a database
+/// that the old runtime can still own; it can keep the eviction reply pending.
 async fn report_stopped_when_released<F, Fut>(
     op: OpId,
     cell: String,
@@ -1119,8 +1124,8 @@ where
         // An abandoned eviction is the one failure that must not be retried.
         // The cell is resident at its own epoch with a request waiting on it,
         // and a retry would take the cell the abandonment just gave back.
-        // `RuntimeStopFailed` is the same ending a stop that ran out of time
-        // reports, and the core answers both by starting the cell in place.
+        // The core restarts both outcomes in place, but callers must be able
+        // to distinguish this cancellation from an execution failure.
         if let Some(abandoned) = error.downcast_ref::<crate::replication::EvictionAbandoned>() {
             tracing::info!(
                 event,
@@ -1129,7 +1134,7 @@ where
                 reason = %abandoned,
                 "a request reached the cell before the eviction took it; restarting it in place"
             );
-            return CompletedEffect::plain(Event::RuntimeStopFailed { op });
+            return CompletedEffect::plain(Event::RuntimeStopCancelled { op });
         }
         if deadline_mono_ms.is_some_and(|deadline| crate::asyncrt::mono_ms() >= deadline) {
             tracing::warn!(
@@ -1641,11 +1646,17 @@ impl AppHandle {
         let _ = self.tx.send(Message::WebSocketClosed { cell, websocket });
     }
 
-    pub async fn evict(&self, cell: String) {
+    /// Try eviction now, or join the eviction already running on this node.
+    /// Success confirms that operation or settled local absence; later demand
+    /// can activate the cell again before the caller receives the reply.
+    pub async fn evict(&self, cell: CellId) -> Result<EvictSuccess, EvictError> {
         let (reply, receive) = oneshot::channel();
-        if self.tx.send(Message::Evict { cell, reply }).is_ok() {
-            let _ = receive.await;
-        }
+        self.tx
+            .send(Message::Evict { cell, reply })
+            .map_err(|_| EvictError::Failed(EvictFailure::ActorUnavailable))?;
+        receive
+            .await
+            .map_err(|_| EvictError::Failed(EvictFailure::ReplyLost))?
     }
 
     pub async fn invalidate_remote(&self, cell: String, node: String, epoch: u64) {
@@ -1692,8 +1703,21 @@ impl AppHandle {
                 "draining": runtime
                     .draining_generations()
                     .into_iter()
-                    .map(|(id, version)| serde_json::json!({"generation": id, "version": version}))
+                    .map(|generation| {
+                        serde_json::json!({
+                            "generation": generation.id(),
+                            "version": generation.version(),
+                            "isolates": generation.isolate_census(),
+                        })
+                    })
                     .collect::<Vec<_>>(),
+                // The V8 heaps behind the counters above. A dormant cell
+                // keeps no isolate of its own, so a cell pool whose
+                // `live_empty` persists across maintenance passes, or whose
+                // `retiring` never frees, is memory the node holds for
+                // nothing -- the residual GCE measured at about 160 KB per
+                // hibernated cell (measured 2026-09-03).
+                "isolates": generation.isolate_census(),
                 // Resident cells moving to the current generation right now,
                 // and the generation each resident cell runs: the two numbers
                 // an operator watches while a deployment converges.
@@ -1892,9 +1916,7 @@ pub struct Actor {
     handoff_accepts: BTreeMap<u64, (String, HandoffAcceptWaiter)>,
     route_timings: BTreeMap<String, CellRouteTiming>,
     pending_workers: BTreeMap<u64, oneshot::Sender<WorkerRouted>>,
-    eviction_waiters: BTreeMap<String, Vec<oneshot::Sender<()>>>,
-    durability_waiters: BTreeMap<u64, (String, Vec<oneshot::Sender<()>>)>,
-    eviction_stops: BTreeMap<u64, Vec<oneshot::Sender<()>>>,
+    pending_evictions: BTreeMap<u64, EvictionReply>,
     /// Outputs held by the gate, keyed by request and channel. Every output but
     /// a captured `WsHibernatable` frame waits here for the core's `Release`.
     gated_responses: BTreeMap<HeldOutputKey, oneshot::Sender<Result<(), RequestError>>>,
@@ -2423,12 +2445,10 @@ impl Actor {
             handoff_accepts: BTreeMap::new(),
             route_timings: BTreeMap::new(),
             pending_workers: BTreeMap::new(),
-            eviction_waiters: BTreeMap::new(),
-            durability_waiters: BTreeMap::new(),
+            pending_evictions: BTreeMap::new(),
             gated_responses: BTreeMap::new(),
             ws_gates: BTreeMap::new(),
             ws_gated: BTreeMap::new(),
-            eviction_stops: BTreeMap::new(),
             published: BTreeSet::new(),
             fail_publish_once,
             publishes: 0,
@@ -2507,10 +2527,6 @@ impl Actor {
                 websocket,
                 reply,
             } => {
-                let retired_durability = match self.state.phase(&cell) {
-                    Some(Phase::EnsuringDurability { op, .. }) => Some(*op),
-                    _ => None,
-                };
                 self.pending.insert(request, reply);
                 let ownership_handoff = handoff_accept.is_some();
                 if let Some(waiter) = handoff_accept {
@@ -2550,13 +2566,6 @@ impl Actor {
                     out,
                 );
                 self.observe_capacity_wait(&cell);
-                if let Some(op) = retired_durability {
-                    if let Some((_, waiters)) = self.durability_waiters.remove(&op) {
-                        for waiter in waiters {
-                            let _ = waiter.send(());
-                        }
-                    }
-                }
             }
             Message::CancelRoute { request } => {
                 self.pending.remove(&request);
@@ -2771,14 +2780,8 @@ impl Actor {
                 alarm,
                 alarm_covered,
             } => {
-                // Folded from the old AlarmObserved-then-ActivityFinished pair the
-                // activity drop sent: observe the alarm and release any retired
-                // durability waiters, then finish the activity — same events, same
-                // order, one message instead of two.
-                let retired_durability = match self.state.phase(&cell) {
-                    Some(Phase::EnsuringDurability { op, .. }) => Some(*op),
-                    _ => None,
-                };
+                // Observe the alarm before releasing the activity. The core
+                // reports whether that observation cancels an eviction proof.
                 self.drive(
                     Event::AlarmObserved {
                         cell,
@@ -2789,13 +2792,6 @@ impl Actor {
                     },
                     out,
                 );
-                if let Some(op) = retired_durability {
-                    if let Some((_, waiters)) = self.durability_waiters.remove(&op) {
-                        for waiter in waiters {
-                            let _ = waiter.send(());
-                        }
-                    }
-                }
                 self.drive(Event::ActivityFinished { request }, out);
             }
             Message::WebSocketOpened {
@@ -2831,10 +2827,6 @@ impl Actor {
                 alarm,
                 covered,
             } => {
-                let retired_durability = match self.state.phase(&cell) {
-                    Some(Phase::EnsuringDurability { op, .. }) => Some(*op),
-                    _ => None,
-                };
                 self.drive(
                     Event::AlarmObserved {
                         cell,
@@ -2845,13 +2837,6 @@ impl Actor {
                     },
                     out,
                 );
-                if let Some(op) = retired_durability {
-                    if let Some((_, waiters)) = self.durability_waiters.remove(&op) {
-                        for waiter in waiters {
-                            let _ = waiter.send(());
-                        }
-                    }
-                }
             }
             Message::NudgeNodeLease => {
                 self.drive(
@@ -2885,37 +2870,20 @@ impl Actor {
                 );
             }
             Message::Evict { reply, .. } if self.preserving => {
-                let _ = reply.send(());
+                let _ = reply.send(Err(EvictError::Refused(EvictRefusal::NodeUnavailable)));
             }
-            Message::Evict { cell, reply } if self.state.is_active(&cell) => {
-                let _ = reply.send(());
+            Message::Evict { cell, reply } => {
+                let request = crate::asyncrt::next_core_request();
+                self.pending_evictions.insert(request, reply);
+                self.drive(
+                    Event::EvictRequested {
+                        request,
+                        cell,
+                        now_mono_ms: crate::asyncrt::mono_ms(),
+                    },
+                    out,
+                );
             }
-            Message::Evict { cell, reply } => match self.state.phase(&cell) {
-                Some(Phase::Resident { .. }) => {
-                    self.eviction_waiters
-                        .entry(cell.clone())
-                        .or_default()
-                        .push(reply);
-                    self.drive(Event::Evict { cell }, out);
-                }
-                Some(Phase::EnsuringDurability { op, .. }) => {
-                    self.durability_waiters
-                        .entry(*op)
-                        .or_insert_with(|| (cell, Vec::new()))
-                        .1
-                        .push(reply);
-                }
-                Some(Phase::Cleaning {
-                    op,
-                    cause: StopCause::Evict { .. },
-                    ..
-                }) => {
-                    self.eviction_stops.entry(*op).or_default().push(reply);
-                }
-                _ => {
-                    let _ = reply.send(());
-                }
-            },
             Message::InvalidateRemote {
                 cell,
                 node,
@@ -3055,62 +3023,17 @@ impl Actor {
         let mut events = VecDeque::from([first]);
         while let Some(event) = events.pop_front() {
             self.close_handoff_phase(&event);
-            let durability = match &event {
-                Event::DurabilityChecked { op, .. } => Some(*op),
-                // A deadline resolves the same operation the proof would
-                // have, so it has to release the same waiters. Without this
-                // the core abandons the eviction and the caller that asked
-                // for it stays blocked on a proof that is no longer coming.
-                Event::TimerFired {
-                    timer: Timer::OperationDeadline { op },
-                    ..
-                } => Some(*op),
-                _ => None,
-            };
-            // A bounded stop that gave up also ends the eviction the
-            // waiters asked about; without this branch `/evict/` waited
-            // forever on a cell that had already restarted in place.
-            let stopped = match &event {
-                Event::RuntimeStopped { op } | Event::RuntimeStopFailed { op } => Some(*op),
-                _ => None,
-            };
-            // The stop has an ending, so its signal can no longer change
-            // anything. Dropping it here keeps the map the size of the stops
-            // actually in flight.
-            if let Some(op) = stopped {
-                self.eviction_abandons.remove(&op);
+            if let Event::RuntimeStopped { op }
+            | Event::RuntimeStopFailed { op }
+            | Event::RuntimeStopCancelled { op } = &event
+            {
+                self.eviction_abandons.remove(op);
             }
             let effects = apply_core_event(&mut self.state, event);
-            if let Some(op) = durability {
-                if let Some((_, waiters)) = self.durability_waiters.remove(&op) {
-                    let stop = effects.iter().find_map(|effect| match effect {
-                        Effect::StopRuntime {
-                            op,
-                            cause: StopCause::Evict { .. },
-                            ..
-                        } => Some(*op),
-                        _ => None,
-                    });
-                    if let Some(stop) = stop {
-                        self.eviction_stops.entry(stop).or_default().extend(waiters);
-                    } else {
-                        for waiter in waiters {
-                            let _ = waiter.send(());
-                        }
-                    }
-                }
-            }
             for effect in effects {
                 self.execute(effect, &mut events, out);
             }
             self.settle_handoff_accepts();
-            if let Some(op) = stopped {
-                if let Some(waiters) = self.eviction_stops.remove(&op) {
-                    for waiter in waiters {
-                        let _ = waiter.send(());
-                    }
-                }
-            }
             if self.validate_invariants {
                 self.state.validate().expect("celld core invariant");
             }
@@ -3776,6 +3699,21 @@ impl Actor {
                 }
                 immediate.push_back(Event::Published { op, result });
             }
+            Effect::EvictionAdmission { request, result } => {
+                let result = match result {
+                    Ok(EvictionAdmission::Pending) => return,
+                    Ok(EvictionAdmission::Absent) => Ok(EvictSuccess::AlreadyAbsent),
+                    Err(error) => Err(error),
+                };
+                if let Some(reply) = self.pending_evictions.remove(&request) {
+                    let _ = reply.send(result);
+                }
+            }
+            Effect::EvictionFinished { request, result } => {
+                if let Some(reply) = self.pending_evictions.remove(&request) {
+                    let _ = reply.send(result);
+                }
+            }
             Effect::EnsureDurable {
                 op,
                 cell,
@@ -3795,8 +3733,6 @@ impl Actor {
                         ),
                     );
                 }
-                let waiters = self.eviction_waiters.remove(&cell).unwrap_or_default();
-                self.durability_waiters.insert(op, (cell.clone(), waiters));
                 if let Some(runtime) = self.host.clone() {
                     // A hot cell can merge thousands of staged LTX rows while
                     // this future is between awaits. Keep that synchronous
@@ -4144,13 +4080,6 @@ impl Actor {
                 }
             }
             Effect::CompleteWorker { request, route } => {
-                if let Some(op) = route.as_ref().and_then(|route| route.retired_durability) {
-                    if let Some((_, waiters)) = self.durability_waiters.remove(&op) {
-                        for waiter in waiters {
-                            let _ = waiter.send(());
-                        }
-                    }
-                }
                 if let Some(reply) = self.pending_workers.remove(&request) {
                     let reserved = route.is_some();
                     if reply.send(WorkerRouted { request, route }).is_err() && reserved {
@@ -4234,7 +4163,6 @@ impl Actor {
         // `capacity_waiting` is queued behind residency. The census says where
         // every cell is, which `occupied` cannot: it counts residency, so a
         // node part-way through thousands of cold starts reports almost none.
-        // Issue #50 is open because none of this was recorded at the time.
         let phases = self
             .state
             .phase_census()
@@ -4243,7 +4171,7 @@ impl Actor {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
+            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"allocator\":{},\"libc_malloc\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
             self.ownership.name(),
             self.state.owned_cells(),
             self.state.occupied(),
@@ -4266,6 +4194,12 @@ impl Actor {
                 .map_or_else(|| "null".to_string(), |reason| format!("{reason:?}")),
             memory.rss_bytes,
             memory.in_use_bytes,
+            // The allocator's split of the two numbers above. `None`
+            // serializes as null, so a failed read leaves the rest intact.
+            serde_json::to_string(&crate::memory::allocator_stats())
+                .unwrap_or_else(|_| "null".to_string()),
+            serde_json::to_string(&crate::memory::libc_malloc_stats())
+                .unwrap_or_else(|_| "null".to_string()),
             memory
                 .cgroup_working_set_bytes
                 .map_or_else(|| "null".to_string(), |bytes| bytes.to_string()),

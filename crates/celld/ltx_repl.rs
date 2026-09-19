@@ -187,6 +187,9 @@ struct SinkFetcher {
     registration: Arc<Mutex<RegistrationState>>,
     cell: String,
     epoch: u64,
+    // One snapshot per compaction round. Opening every L0 row must not
+    // repeat a persisted-index fallback for the same slow cell.
+    rows: tokio::sync::Mutex<Option<Vec<celld_ltx::LocatedRow>>>,
 }
 
 impl celld_ltx::BundleFetcher for SinkFetcher {
@@ -200,9 +203,21 @@ impl celld_ltx::BundleFetcher for SinkFetcher {
         >,
     > {
         Box::pin(async move {
+            let mut rows = self.rows.lock().await;
+            if let Some(rows) = rows.as_ref() {
+                return Ok(rows.clone());
+            }
             let sink =
                 registered_durability(&self.registration).map(|targets| targets.manager.clone());
-            Ok(sink.map_or_else(Vec::new, |sink| sink.rows_for(&self.cell, self.epoch)))
+            let fetched = match sink {
+                Some(sink) => sink
+                    .rows_for(&self.cell, self.epoch)
+                    .await
+                    .map_err(|error| celld_ltx::Error::Other(error.to_string().into()))?,
+                None => Vec::new(),
+            };
+            *rows = Some(fetched.clone());
+            Ok(fetched)
         })
     }
 
@@ -530,6 +545,7 @@ struct CellCompaction {
     cell: String,
     epoch: u64,
     client: celld_ltx::BundleOverlayClient<ObjectStoreClient>,
+    fetcher: Arc<SinkFetcher>,
     local_path: PathBuf,
     host: LtxHost,
     queue: mpsc::UnboundedSender<CompactionWork>,
@@ -540,6 +556,10 @@ struct CellCompaction {
     /// L0 bytes uploaded since the last fold, the size trigger's measure.
     pending_bytes: AtomicU64,
     compacted_txid: AtomicU64,
+    /// Ship rounds also queue work, so the failure delay must gate admission
+    /// rather than only delaying the worker's own requeue task.
+    retry_after_ms: AtomicU64,
+    failures: AtomicU64,
     queued: AtomicBool,
     cancelled: AtomicBool,
     cancel: Notify,
@@ -692,6 +712,8 @@ struct Cell {
     upload_round_receipts: Mutex<Vec<LtxUploadRoundReceiptForWorldV1>>,
     #[cfg(all(test, celld_internal_tests))]
     fleet_credit_receipts: Mutex<Vec<LtxFleetCreditReceiptForWorldV1>>,
+    #[cfg(all(test, celld_internal_tests))]
+    fleet_capture_receipts: Mutex<Vec<LtxFleetCaptureReceiptForWorld>>,
 }
 type CellHandle = Arc<Cell>;
 
@@ -1322,7 +1344,7 @@ impl LtxRepl {
             .get(&key)
             .map(|handle| percell_coverage(handle));
         let known = self.covered_by_cell.lock().unwrap().get(&key).copied();
-        if let Some(covered) = resident.max(known).filter(|covered| *covered > 0) {
+        if let Some(covered) = resident.filter(|covered| *covered > 0).max(known) {
             return covered;
         }
         // Nothing this process put there: a cell it never served, or one it
@@ -1331,14 +1353,16 @@ impl LtxRepl {
         // answer; the watermark only rises, so a remembered value never
         // over-reports. A restarting node recovers thousands of cells it
         // never served, so this listing is its whole recovery cost.
-        let covered = self
-            .client_for(cell, epoch)
-            .max_txid_all_levels()
-            .await
-            .map(|txid| txid.0)
-            .unwrap_or(0);
-        self.note_covered(cell, epoch, covered);
-        covered
+        match self.client_for(cell, epoch).max_txid_all_levels().await {
+            Ok(txid) => {
+                // Zero is a useful answer too: undrained cells otherwise
+                // force the same empty-prefix LIST on every GC tick. A read
+                // error is not zero coverage and must remain retryable.
+                self.note_covered(cell, epoch, txid.0);
+                txid.0
+            }
+            Err(_) => 0,
+        }
     }
 
     /// Remember that the bucket holds this cell epoch through `txid`.
@@ -1925,34 +1949,43 @@ impl LtxRepl {
             upload_round_receipts: Mutex::new(Vec::new()),
             #[cfg(all(test, celld_internal_tests))]
             fleet_credit_receipts: Mutex::new(Vec::new()),
-            compaction: self.compaction_queue.as_ref().map(|queue| CellCompaction {
-                cell: cell.to_string(),
-                epoch,
-                // The overlay lets compaction read bundle-resident frames
-                // beside the per-cell objects; its output stays pure
-                // per-cell L1s, which is the continuous drain.
-                client: celld_ltx::BundleOverlayClient::new(
-                    self.client_for(cell, epoch),
-                    Some(Arc::new(SinkFetcher {
-                        registration: self.registration.clone(),
-                        cell: cell.to_string(),
-                        epoch,
-                    })),
-                ),
-                local_path: Db::meta_path_for_path(&dst),
-                host: self.ltx_host.clone(),
-                queue: queue.clone(),
-                base_txid: continuation.map_or(1, |(txid, _)| txid.0),
-                min_txids: self.compaction_min_txids,
-                min_bytes: self.compaction_min_bytes,
-                pending_bytes: AtomicU64::new(0),
-                compacted_txid: AtomicU64::new(0),
-                queued: AtomicBool::new(false),
-                cancelled: AtomicBool::new(false),
-                cancel: Notify::new(),
-                #[cfg(all(test, celld_internal_tests))]
-                finish_pause: Mutex::new(None),
-                run: tokio::sync::Mutex::new(()),
+            #[cfg(all(test, celld_internal_tests))]
+            fleet_capture_receipts: Mutex::new(Vec::new()),
+            compaction: self.compaction_queue.as_ref().map(|queue| {
+                let fetcher = Arc::new(SinkFetcher {
+                    registration: self.registration.clone(),
+                    cell: cell.to_string(),
+                    epoch,
+                    rows: tokio::sync::Mutex::new(None),
+                });
+                CellCompaction {
+                    cell: cell.to_string(),
+                    epoch,
+                    // The overlay lets compaction read bundle-resident frames
+                    // beside the per-cell objects; its output stays pure
+                    // per-cell L1s, which is the continuous drain.
+                    client: celld_ltx::BundleOverlayClient::new(
+                        self.client_for(cell, epoch),
+                        Some(fetcher.clone()),
+                    ),
+                    fetcher,
+                    local_path: Db::meta_path_for_path(&dst),
+                    host: self.ltx_host.clone(),
+                    queue: queue.clone(),
+                    base_txid: continuation.map_or(1, |(txid, _)| txid.0),
+                    min_txids: self.compaction_min_txids,
+                    min_bytes: self.compaction_min_bytes,
+                    pending_bytes: AtomicU64::new(0),
+                    compacted_txid: AtomicU64::new(0),
+                    retry_after_ms: AtomicU64::new(0),
+                    failures: AtomicU64::new(0),
+                    queued: AtomicBool::new(false),
+                    cancelled: AtomicBool::new(false),
+                    cancel: Notify::new(),
+                    #[cfg(all(test, celld_internal_tests))]
+                    finish_pause: Mutex::new(None),
+                    run: tokio::sync::Mutex::new(()),
+                }
             }),
         });
         #[cfg(celld_internal_tests)]
@@ -2094,14 +2127,14 @@ impl LtxRepl {
         celld_ltx::paged_vfs::hydration(&self.paged_vfs_name(cell, epoch)?)
     }
 
-    /// The private suite's chain-size threshold for paging, so a world can
+    /// The test chain-size threshold for paging, so a world can
     /// page a small cut or clone one.
     #[cfg(all(test, celld_internal_tests))]
     pub fn set_paged_min_bytes_for_test(&self, bytes: u64) {
         self.paged_min_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// The private suite's switch for paged restore, so a world runs its
+    /// The test switch for paged restore, so a world runs its
     /// schedules over the fault path without the process environment. It
     /// pages every cut; `set_paged_min_bytes_for_test` restores a threshold.
     #[cfg(all(test, celld_internal_tests))]
@@ -2341,14 +2374,14 @@ impl LtxRepl {
         }
     }
 
-    /// Return the configured durability deadline to a private deterministic
+    /// Return the configured durability deadline to a deterministic
     /// world, so a bounded-liveness assertion uses the production value.
     #[cfg(all(test, celld_internal_tests))]
     pub(crate) fn durability_timeout_ms_for_world(&self) -> u64 {
         self.durability_timeout_ms
     }
 
-    /// Lower the handoff snapshot budget, so a private world can hand off a
+    /// Lower the handoff snapshot budget, so a test world can hand off a
     /// small database the way production hands off a whale.
     #[cfg(all(test, celld_internal_tests))]
     pub(crate) fn set_handoff_snapshot_budget_for_world(&self, bytes: u64) {
@@ -3204,6 +3237,7 @@ fn maybe_queue_compaction(handle: &CellHandle, durable_txid: u64) {
         >= compaction.min_txids;
     let due_by_bytes = compaction.pending_bytes.load(Ordering::SeqCst) >= compaction.min_bytes;
     if compaction.cancelled.load(Ordering::SeqCst)
+        || asyncrt::mono_ms() < compaction.retry_after_ms.load(Ordering::SeqCst)
         || !(due_by_txids || due_by_bytes)
         || compaction
             .queued
@@ -3316,24 +3350,30 @@ async fn compact_cell(
     let source_at_start = source_position();
     let queue_ms = asyncrt::mono_ms().saturating_sub(queued_at_mono_ms);
     let started = asyncrt::mono_ms();
+    // The run lock keeps the snapshot stable through listing and every row
+    // open. The next round must see bundles published since this one began.
+    *compaction.fetcher.rows.lock().await = None;
     let compactor = ReplicaCompactor::new(&compaction.client)
         .with_host(compaction.host.clone())
         .with_verification(true)
         .with_local_path(&compaction.local_path)
         .with_limits(COMPACTION_MAX_FILES, COMPACTION_MAX_INPUT_BYTES)
         .with_base(TXID(compaction.base_txid));
-    let worker = compactor.compact_with_progress(1);
-    tokio::pin!(worker);
-    let result = if cancellable {
-        asyncrt::select_biased! {
-            "a cancellation that ties compaction completion discards the cancelled round";
-            _ = &mut cancelled => None,
-            result = &mut worker => Some(result),
+    let result = {
+        let worker = compactor.compact_with_progress(1);
+        tokio::pin!(worker);
+        if cancellable {
+            asyncrt::select_biased! {
+                "a cancellation that ties compaction completion discards the cancelled round";
+                _ = &mut cancelled => None,
+                result = &mut worker => Some(result),
+            }
+        } else {
+            Some(worker.as_mut().await)
         }
-    } else {
-        Some(worker.as_mut().await)
     };
 
+    *compaction.fetcher.rows.lock().await = None;
     #[cfg(all(test, celld_internal_tests))]
     {
         let pause = compaction.finish_pause.lock().unwrap().take();
@@ -3430,23 +3470,44 @@ async fn compact_cell(
             CompactionOutcome::Cancelled
         }
     };
+    let failure_pause = if outcome == CompactionOutcome::Failed {
+        let failures = compaction.failures.fetch_add(1, Ordering::SeqCst);
+        let pause = Duration::from_secs((30u64 << failures.min(4)).min(300));
+        compaction.retry_after_ms.store(
+            asyncrt::mono_ms().saturating_add(pause.as_millis() as u64),
+            Ordering::SeqCst,
+        );
+        Some(pause)
+    } else {
+        compaction.failures.store(0, Ordering::SeqCst);
+        compaction.retry_after_ms.store(0, Ordering::SeqCst);
+        None
+    };
+    // Publish the delay before admitting another ship-triggered attempt.
     compaction.queued.store(false, Ordering::SeqCst);
 
-    // A no-work result can mean that only old bundle metadata is missing.
-    // Its truthful coverage stays behind durable_txid, so self-requeueing
+    // A no-work result proves coverage only through the sources that the
+    // overlay can see, which can end below durable_txid. Self-requeueing
     // would spin on the same empty listing. Preserve a publication that raced
     // this attempt: its queue request can lose the queued CAS. Read its two
     // watermarks after clearing queued, so a later publisher queues itself.
-    let requeue = outcome == CompactionOutcome::Advanced
-        || (outcome == CompactionOutcome::Current && source_position() != source_at_start);
+    // A failed round schedules its own retry after the backoff, so a cell
+    // with no later ship round still retries.
+    let requeue = match outcome {
+        CompactionOutcome::Advanced | CompactionOutcome::Failed => true,
+        CompactionOutcome::Current => source_position() != source_at_start,
+        CompactionOutcome::Cancelled => false,
+    };
     if requeue && !compaction.cancelled.load(Ordering::SeqCst) {
         // Pace consecutive rounds for one cell: a restart with a large tail
         // otherwise drains back-to-back for minutes. The pause matches the
         // round it follows (capped), so a cell compacts at half duty cycle
         // while the worker slot frees for other cells immediately. The owner
         // retains this delayed task, but the task does not retain the permit.
-        let pause = Duration::from_millis(asyncrt::mono_ms().saturating_sub(started))
-            .min(Duration::from_secs(2));
+        let pause = failure_pause.unwrap_or_else(|| {
+            Duration::from_millis(asyncrt::mono_ms().saturating_sub(started))
+                .min(Duration::from_secs(2))
+        });
         let handle_ = Arc::downgrade(&handle);
         let Some(requeues) = requeues else {
             return outcome;
@@ -4152,6 +4213,19 @@ async fn ship_loop(
         // frame, not only that the bucket already covers them. Queue the
         // empty credit through the same ordered pipeline, so an earlier
         // failure discards it instead of releasing an unproved fleet ticket.
+        #[cfg(all(test, celld_internal_tests))]
+        let observer_rounds = credits
+            .iter()
+            .map(|(handle, tickets, position)| {
+                let count = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.cell == handle.observer_cell && entry.epoch == handle.observer_epoch
+                    })
+                    .count();
+                handle.begin_fleet_capture_for_world(*tickets, *position, count, capture_epoch)
+            })
+            .collect::<Vec<_>>();
         let append = if entries.is_empty() {
             None
         } else {
@@ -4168,6 +4242,8 @@ async fn ship_loop(
         let submitted = asyncrt::mono_ms();
         inflight.push_back(Box::pin(async move {
             ShipRound {
+                #[cfg(all(test, celld_internal_tests))]
+                observer_rounds,
                 completion: match append {
                     Some(append) => ShipRoundCompletion::Append(append.await),
                     None => ShipRoundCompletion::OrderedEmpty,
@@ -4205,6 +4281,8 @@ enum ShipRoundCompletion {
 
 /// One pipelined round's completion, applied strictly in submission order.
 struct ShipRound {
+    #[cfg(all(test, celld_internal_tests))]
+    observer_rounds: Vec<LtxFleetCaptureForWorld>,
     completion: ShipRoundCompletion,
     credits: Vec<(CellHandle, u64, u64)>,
     covered_seq: u64,
@@ -4242,6 +4320,10 @@ fn apply_round(
     let proof_last_seq = match &round.completion {
         ShipRoundCompletion::Append(completion) => {
             let Some(last_seq) = completion.last_seq() else {
+                #[cfg(all(test, celld_internal_tests))]
+                for observer in &round.observer_rounds {
+                    observer.finish(LtxFleetCaptureStatusForWorld::Failed);
+                }
                 return false;
             };
             if last_seq > round.covered_seq {
@@ -4309,6 +4391,10 @@ fn apply_round(
         proof_last_seq = ?proof_last_seq,
         "shipped a log batch"
     );
+    #[cfg(all(test, celld_internal_tests))]
+    for observer in &round.observer_rounds {
+        observer.finish(LtxFleetCaptureStatusForWorld::Applied);
+    }
     for (handle, tickets, position) in round.credits {
         #[cfg(all(test, celld_internal_tests))]
         handle.record_fleet_credit_for_world(tickets, position, proof_last_seq);

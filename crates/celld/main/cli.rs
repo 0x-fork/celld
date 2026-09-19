@@ -41,6 +41,7 @@ pub(crate) enum Action {
     D1(Vec<String>),
     Kv(Vec<String>),
     Queue(Vec<String>),
+    R2(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -77,6 +78,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "d1" => return Ok(Action::D1(arguments)),
             "kv" => return Ok(Action::Kv(arguments)),
             "queue" => return Ok(Action::Queue(arguments)),
+            "r2" => return Ok(Action::R2(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -272,6 +274,7 @@ USAGE:
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]

@@ -212,7 +212,7 @@ impl PressureConfig {
     /// The latches are carried separately and not derived from the reported
     /// reason. Sharing them lets one crossing hold the node against the other's
     /// watermark, in either direction: a crossing of the ordinary ceiling then
-    /// holds the node on a resident-set watermark, which is issue #36 again,
+    /// holds the node on a resident-set watermark it did not cross,
     /// and a hard-cap crossing then holds it on a ceiling it never crossed.
     pub fn classify(self, s: Load, was: Latches) -> (Latches, Option<&'static str>) {
         let over = |ceiling: Option<u64>, sample: u64, latched: bool| {

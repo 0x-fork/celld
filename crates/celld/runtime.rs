@@ -152,11 +152,13 @@ impl StatelessWorkerJob {
             job: crate::WorkerJob::Fetch {
                 queued_at: Instant::now(),
                 entrypoint,
+                invocation_limits: None,
                 url,
                 method,
                 body,
                 headers,
                 request_id,
+                tail_report: None,
                 reply,
             },
             cancellation,
@@ -1567,15 +1569,15 @@ impl RuntimeManager {
         next
     }
 
-    /// The generations still draining: id and version, for `/state`.
-    pub fn draining_generations(&self) -> Vec<(GenerationId, String)> {
+    /// The generations still draining, for `/state`. Each one holds its
+    /// isolates until the last cell in them moves, so the caller reads the
+    /// census from the generation and not only its version.
+    pub fn draining_generations(&self) -> Vec<Arc<Generation>> {
         self.generations
             .read()
             .expect("generation lock poisoned")
             .draining
-            .iter()
-            .map(|generation| (generation.id, generation.version.clone()))
-            .collect()
+            .clone()
     }
 
     /// Spawn the maintenance loop for one generation's cell pools.
@@ -1735,11 +1737,13 @@ impl RuntimeManager {
         let job = crate::WorkerJob::Fetch {
             queued_at: Instant::now(),
             entrypoint: None,
+            invocation_limits: None,
             url,
             method,
             body,
             headers,
             request_id: Some(request_id),
+            tail_report: None,
             reply,
         };
         tokio::spawn(async move {
@@ -2930,6 +2934,7 @@ async fn drive_worker(
     on_finish(&entry);
     // Dropping `ops` aborts whatever is still pending, which is what a region
     // does on every exit path; their resolvers have to go with them.
+    entry.finish_tail_report();
     entry.abandon();
 }
 
@@ -3490,6 +3495,7 @@ impl StatelessRuntime {
             entrypoint,
             operation,
             props,
+            invocation_limits: None,
             reply,
         })
         .await
@@ -3562,7 +3568,7 @@ impl CellIsolateStartupTiming {
 /// A count rather than a latch, so a test can prove the retry reaches
 /// success instead of only proving that it never proceeds. `debug_assertions`
 /// is the gate `CELLD_TEST_CELL_STARTUP_FAILURE` beside it already uses: the
-/// runtime matrix drives the shipped debug binary, which no private cfg
+/// runtime matrix drives the debug binary, which no internal test cfg
 /// reaches, and a release build compiles neither.
 #[cfg(debug_assertions)]
 fn injected_swap_release_failure() -> Option<anyhow::Error> {

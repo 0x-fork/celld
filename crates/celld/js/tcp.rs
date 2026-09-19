@@ -67,16 +67,16 @@ fn insert(id: u64, stream: Duplex) {
 
 /// Mozilla's roots, the same choice `ws_client` makes and for the same
 /// reason: a downloaded celld must reach TLS hosts on a machine with no
-/// `/etc/ssl/certs`. The private suite's TLS servers present certs from
-/// a test root, injected through the gated seam below.
+/// `/etc/ssl/certs`. Test TLS servers use a root injected through the
+/// gated seam below.
 #[cfg(celld_internal_tests)]
 fn test_root() -> &'static Mutex<Option<Vec<u8>>> {
     static ROOT: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
     ROOT.get_or_init(Default::default)
 }
 
-/// Trust one extra DER root for outbound TLS, so the private suite's
-/// self-signed servers verify. No compatibility guarantee.
+/// Trust one extra DER root for outbound TLS, so test servers with
+/// self-signed certificates verify. No compatibility guarantee.
 #[cfg(celld_internal_tests)]
 #[doc(hidden)]
 pub fn test_extra_tls_root(der: Vec<u8>) {

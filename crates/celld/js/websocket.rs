@@ -458,8 +458,8 @@ impl WsRegistry {
 /// only within one instance. Each map a socket reaches must therefore belong
 /// to the same instance: a map that stayed process-wide would be shared by
 /// the sockets that two instances both numbered, and a second instance is not
-/// hypothetical — the private build runs one per test runtime, and a
-/// per-isolate or per-generation instance in production would inherit the
+/// hypothetical: a test can run multiple instances, and a per-isolate or
+/// per-generation instance in production would inherit the
 /// collision.
 pub(crate) struct WebSocketService {
     registry: Arc<std::sync::Mutex<WsRegistry>>,

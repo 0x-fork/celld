@@ -45,16 +45,10 @@ pub(crate) struct NodeLeaseWire {
     /// records readable during a mixed-version rollout.
     #[serde(default)]
     pub(crate) paced_handoff: bool,
-    /// The process generation. In production this IS `probe_public_key`,
-    /// published twice under two names. Part 1 (this release) reads the
-    /// probe key when the old field is absent, see `NodeLeaseWireRaw`.
-    /// Part 2, after 2026-10-01: stop writing this field, publish only
-    /// `probe_public_key`, and derive the generation from it everywhere,
-    /// which needs the probe signer to draw from the simulation-aware RNG
-    /// so the deterministic worlds keep their replay, and the private
-    /// fixtures that plant `ownership_index_generation` to plant
-    /// `probe_public_key` instead. The reader fallback stays; it becomes
-    /// the only path.
+    /// The process generation has the same value as `probe_public_key` in
+    /// production. Keep writing both names while older nodes read this one.
+    /// `NodeLeaseWireRaw` reads the probe key when this field is absent, so
+    /// a later format can omit the duplicate after mixed-version support ends.
     #[serde(default, rename = "ownership_index_generation")]
     pub(crate) generation: String,
     /// The folded node log: absent until the

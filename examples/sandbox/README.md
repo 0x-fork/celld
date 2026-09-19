@@ -28,5 +28,5 @@ celld deploy . --bucket s3://my-cells-bucket
 `celld deploy` saves the image to the bucket once, and each node loads it
 the first time one of its sandboxes starts. Preview URLs, tunnels, and
 bucket mounts are features of the package and of the container; see the
-[Cloudflare compatibility](../../docs/cloudflare-compat.md#containers)
+[Containers documentation](../../docs/services/containers.md)
 notes for what celld does not provide.

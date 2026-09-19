@@ -30,6 +30,7 @@
     "P-384": "P-384", "secp384r1": "P-384",
     "P-521": "P-521", "secp521r1": "P-521",
   };
+  const _canonicalEcCurve = (curve) => _EC_CURVES[_curveName(curve)];
   // The asymmetric algorithms, as the uppercased name `_algorithmName`
   // produces mapped to the spelling `key.algorithm.name` reports. The
   // uppercased form is for lookup only: echoing it back names an algorithm
@@ -137,7 +138,7 @@
       // The host names the curve as node:crypto does; Web Crypto spells it
       // as the caller did, so map it back.
       reported.namedCurve =
-        _EC_CURVES[details.namedCurve] ?? details.namedCurve;
+        _canonicalEcCurve(details.namedCurve) ?? details.namedCurve;
     } else if (algorithm?.namedCurve !== undefined) {
       // Ed25519 and X25519 have one curve each, so the parsed key carries
       // no curve to report. Cloudflare still puts `namedCurve` on such a
@@ -495,7 +496,7 @@
           }
         }
         if (kind === "ec") {
-          const curve = _EC_CURVES[_curveName(algorithm?.namedCurve)];
+          const curve = _canonicalEcCurve(algorithm?.namedCurve);
           if (curve === undefined)
             throw _notSupported("unsupported curve: " + algorithm?.namedCurve);
           options.namedCurve = curve;
@@ -543,7 +544,7 @@
               : null;
       if (!operation) throw _notSupported("unsupported sign algorithm: " + name);
       if (name === "ECDSA") {
-        if (_EC_CURVES[_curveName(key?.algorithm?.namedCurve)] !== "P-256") {
+        if (_canonicalEcCurve(key?.algorithm?.namedCurve) !== "P-256") {
           throw _notSupported("ECDSA signatures support only P-256");
         }
         if (_hashName(algorithm?.hash) !== "SHA-256") {
@@ -583,7 +584,7 @@
       const material = key?.__celldMaterial?.bytes;
       if (!material) throw _notSupported("verify needs an spki public key");
       if (name === "ECDSA") {
-        if (_EC_CURVES[_curveName(key?.algorithm?.namedCurve)] !== "P-256") {
+        if (_canonicalEcCurve(key?.algorithm?.namedCurve) !== "P-256") {
           throw _notSupported("ECDSA signatures support only P-256");
         }
         if (_hashName(algorithm?.hash) !== "SHA-256") {
@@ -798,4 +799,5 @@
   // left the exponent off an RSA key. The loop below hides this name, and
   // the module is lazy, so it always resolves after this script runs.
   __celld.$$keyAlgorithm = _keyAlgorithm;
+  __celld.$$canonicalEcCurve = _canonicalEcCurve;
 })();
