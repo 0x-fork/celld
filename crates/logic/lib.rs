@@ -15,6 +15,7 @@ pub mod cron;
 pub mod dead_node_reconciliation;
 pub mod drain;
 pub mod durability;
+pub mod epoch_gc;
 pub mod format;
 pub mod gate;
 pub mod http;
@@ -1004,7 +1005,9 @@ impl State {
     }
 
     /// Whether the last load sample reserves memory below every pressure
-    /// resume line. False before the first sample.
+    /// resume line. False until the first `LoadSampled` event. The actor must
+    /// fold a sample before it publishes a lease, or the lease reports no
+    /// headroom.
     pub fn memory_headroom(&self) -> bool {
         self.memory_headroom
     }

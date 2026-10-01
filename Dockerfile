@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.98.1
 ARG CELLD_COMMIT=unknown
 
 FROM rust:${RUST_VERSION}-bookworm AS build
